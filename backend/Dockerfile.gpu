@@ -1,0 +1,55 @@
+# syntax=docker/dockerfile:1.7
+#
+# PWR Digital Twin — GPU Worker image (ROCm / PyTorch)
+#
+# Base: rocm/pytorch ships ROCm 6.x + PyTorch pre-built for AMD GPUs.
+# We layer the application dependencies on top using pip.
+#
+# Build:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml build worker-gpu
+#
+# The rocm/pytorch image bundles a conda environment whose Python interpreter
+# is typically 3.11.  Our app is compatible with 3.11+ (no 3.12-only syntax).
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM rocm/pytorch:latest AS gpu-runtime
+
+LABEL maintainer="pwr-twin-team"
+LABEL description="PWR Digital Twin — GPU Worker (ROCm/PyTorch)"
+
+# Install uv (fast Python package installer) — binary copy from upstream image
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+WORKDIR /app
+
+# ── Install application dependencies ────────────────────────────────────────
+# We install into the *system* (conda-base) Python that comes with the ROCm
+# image, NOT into an isolated venv, so that PyTorch's ROCm libraries remain
+# visible to all packages.
+# `uv pip install --system` bypasses the venv requirement for this purpose.
+COPY pyproject.toml ./
+
+# Install all [project.dependencies] into the base Python env.
+# Torch is already installed by the base image; uv will skip it if versions
+# are compatible or upgrade in-place if needed.
+RUN uv pip install --system --break-system-packages --no-cache -r pyproject.toml
+
+# ── Copy application source ──────────────────────────────────────────────────
+COPY . .
+
+# ── Runtime environment ───────────────────────────────────────────────────────
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH="/app" \
+    # Activate PyTorch-ROCm backend for tensor_solver.py
+    PHYSICS_BACKEND="torch" \
+    # ROCm / HIP paths (pre-set in rocm/pytorch but repeated for clarity)
+    ROCM_PATH="/opt/rocm" \
+    HIP_PATH="/opt/rocm" \
+    # Suppress HIP JIT warnings that are harmless but verbose
+    AMD_LOG_LEVEL="0"
+
+# ── Default command ───────────────────────────────────────────────────────────
+# Override in docker-compose.gpu.yml if a different concurrency is needed.
+CMD ["celery", "-A", "app.worker.celery_app", "worker", \
+     "--loglevel=info", "--concurrency=2", "--queues=gpu,celery"]

@@ -1,0 +1,129 @@
+# PWR Digital Twin — GPU Compose Override (AMD ROCm)
+#
+# Adds a `worker-gpu` service that runs the Celery worker on an AMD GPU via
+# ROCm.  The default CPU stack (docker-compose.yml) is unaffected.
+#
+# ── Usage ────────────────────────────────────────────────────────────────────
+#
+#   Native Linux (RDNA2/RDNA3, ROCm 6.x):
+#     docker compose -f docker-compose.yml -f docker-compose.gpu.yml \
+#       up worker-gpu
+#
+#   WSL2 (DXG bridge, experimental — requires AMD Adrenalin 23.40.27.06+):
+#     HSA_OVERRIDE_GFX_VERSION=11.0.0 \
+#     docker compose -f docker-compose.yml -f docker-compose.gpu.yml \
+#       up worker-gpu
+#
+# ── Prerequisites ─────────────────────────────────────────────────────────────
+#
+#   Native Linux:
+#     - ROCm 6.x stack installed on the host
+#     - Host user in `render` and `video` groups:
+#         sudo usermod -aG render,video $USER
+#     - Devices /dev/kfd and /dev/dri/renderD* present
+#
+#   WSL2:
+#     - AMD Adrenalin driver ≥ 23.40.27.06 installed on the Windows host
+#     - /dev/dxg present inside WSL2 (auto-created by the driver)
+#     - ROCm support inside WSL2 is EXPERIMENTAL; results may vary
+#
+# ── CPU Fallback guarantee ────────────────────────────────────────────────────
+#
+#   The standard `worker` service (docker-compose.yml) is never modified by
+#   this file.  All GPU-specific configuration lives exclusively in
+#   `worker-gpu`.  Running `docker compose up` (without -f override) always
+#   starts the pure-CPU stack.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  worker-gpu:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.gpu
+    container_name: pwr_worker_gpu
+    restart: unless-stopped
+
+    # Override the Celery command to advertise GPU queue and enable
+    # PyTorch / ROCm backend for the tensor solver.
+    command: >
+      celery -A app.worker.celery_app worker
+        --loglevel=info
+        --concurrency=2
+        --queues=gpu,celery
+
+    env_file:
+      - .env
+
+    environment:
+      # ── Physics backend selection ──────────────────────────────────────
+      # tensor_solver.py reads PHYSICS_BACKEND to choose the array module:
+      #   torch  → PyTorch (ROCm or CUDA depending on runtime)
+      #   numpy  → plain NumPy on CPU (fallback if GPU init fails)
+      PHYSICS_BACKEND: "torch"
+
+      # ── ROCm / HIP tuning ─────────────────────────────────────────────
+      # Force GFX IP version so HIP recognises the GPU even when the device
+      # string is not in the shipped device table.  Adjust to your RDNA gen:
+      #   RDNA1 (Navi 10/12/14)  → 10.1.0
+      #   RDNA2 (Navi 21..24)    → 10.3.0
+      #   RDNA3 (Navi 31..33)    → 11.0.0
+      HSA_OVERRIDE_GFX_VERSION: "11.0.0"
+
+      # ── WSL2 DXG bridge ───────────────────────────────────────────────
+      # Instructs HSA runtime to detect GPU via the /dev/dxg interface
+      # exposed by the Windows AMD driver under WSL2.
+      HSA_ENABLE_DXG_DETECTION: "1"
+
+      # Disable GPU kernel caching to ensure clean ROCm init on WSL2.
+      AMD_SERIALIZE_KERNEL: "3"
+
+      # ── HIP / ROCm path hints ─────────────────────────────────────────
+      ROCM_PATH: "/opt/rocm"
+      HIP_PATH: "/opt/rocm"
+      LD_LIBRARY_PATH: "/usr/lib/wsl/lib"
+
+    volumes:
+      - ./backend:/app
+      - /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro
+
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    # ── Device passthrough ────────────────────────────────────────────────
+    #
+    # Native Linux:  uncomment the block below (default).
+    # WSL2:          comment out `devices` and uncomment `volumes` + `dxg`
+    #                block further down.
+    #
+    # NOTE: Docker Compose `devices` requires Docker Engine ≥ 19.03.
+    devices:
+      # HSA kernel driver — required for ROCm runtime
+      #- /dev/kfd
+      # DRM render nodes — typically renderD128, renderD129, ...
+      #- /dev/dri
+      - /dev/dxg:/dev/dxg
+
+    group_add:
+      # Grants the container user access to GPU render and video devices
+      - render
+      - video
+
+    # ── WSL2 alternative device access ───────────────────────────────────
+    # On WSL2 the AMD GPU is exposed via /dev/dxg (DirectX Graphics adapter).
+    # Un-comment these lines and comment out `devices` above when running on
+    # WSL2 with the DXG bridge enabled.
+    #
+    # devices:
+    #   - /dev/dxg
+    # volumes:
+    #   - ./backend:/app
+    #   # D3D12 cache shared with the host driver (WSL2 only)
+    #   - /tmp/.X11-unix:/tmp/.X11-unix:rw
+
+    # Expose Flower or custom GPU metric port if desired
+    # ports:
+    #   - "5556:5556"

@@ -1,0 +1,5 @@
+/backend/.venv/
+/.idea
+/.env
+/multiphysics-pwr-twin/
+/.claude/
