@@ -3,3 +3,4 @@
 /.env
 /multiphysics-pwr-twin/
 /.claude/
+/frontend/node_modules/

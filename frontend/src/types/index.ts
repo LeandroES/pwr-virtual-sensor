@@ -1,3 +1,70 @@
+// ── Virtual Sensor types ───────────────────────────────────────────────────────
+
+export interface SensorSimulateRequest {
+  external_reactivity: number          // [Δk/k]
+  time_span: [number, number]          // [t_start, t_end] [s]
+  dt: number                           // ≤ 0.01 s
+  ensemble_size: number                // [100, 500_000]
+  obs_noise_std_K: number              // RTD noise σ [K]
+  enkf_obs_noise_var_K2?: number       // R [K²]; auto = σ²
+  enkf_inflation_factor?: number       // [1.0, 2.0]
+  device?: 'cuda' | 'cpu'
+  insert_batch_size?: number
+  rng_seed?: number
+}
+
+export interface SensorSimulateResponse {
+  job_id: string
+  status: RunStatus
+  created_at: string
+  ensemble_size: number
+  obs_noise_std_K: number
+  enkf_obs_noise_var_K2: number
+  estimated_steps: number
+}
+
+export interface SensorJobStatus {
+  job_id: string
+  status: RunStatus
+  created_at: string
+  completed_at: string | null
+  error_message: string | null
+  external_reactivity: number
+  time_span_start: number
+  time_span_end: number
+  dt: number
+}
+
+export interface SensorResultPoint {
+  sim_time_s: number
+  noisy_t_coolant: number        // RTD reading [K]
+  inferred_t_fuel_mean: number   // EnKF estimate [K]
+  inferred_t_fuel_std: number    // posterior σ [K]
+  true_t_fuel: number            // ground truth [K]
+  error_K: number                // inferred_mean − true [K]
+}
+
+export interface SensorMetrics {
+  total_points: number
+  rmse_K: number
+  mae_K: number
+  coverage_68pct: number
+  coverage_95pct: number
+  mean_ensemble_std_K: number
+}
+
+export interface SensorResultsResponse {
+  job_id: string
+  status: string
+  completed_at: string | null
+  error_message: string | null
+  metrics: SensorMetrics | null
+  total_point_count: number
+  point_count: number
+  truncated: boolean
+  data: SensorResultPoint[]
+}
+
 // ── Request payloads ──────────────────────────────────────────────────────────
 
 export interface RunCreate {
