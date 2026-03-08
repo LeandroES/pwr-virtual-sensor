@@ -19,6 +19,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# GPU backend — install for ROCm (AMD):
+#   pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
+# or for CUDA (NVIDIA):
+#   pip install torch
+gpu = [
+    "torch>=2.3.0",
+]
 dev = [
     "ruff>=0.6.0",
     "mypy>=1.11.0",
