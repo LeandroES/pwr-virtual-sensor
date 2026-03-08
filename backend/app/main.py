@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.runs import router as runs_router
+from app.api.sensor import router as sensor_router
 from app.core.config import settings
 
 
@@ -32,6 +33,7 @@ app.add_middleware(
 )
 
 app.include_router(runs_router)
+app.include_router(sensor_router)
 
 
 @app.get("/health", tags=["ops"])
