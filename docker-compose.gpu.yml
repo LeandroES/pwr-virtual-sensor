@@ -1,38 +1,39 @@
-# PWR Digital Twin — GPU Compose Override (AMD ROCm)
+# PWR Digital Twin — GPU Worker Compose Override  (AMD ROCm / WSL2)
 #
-# Adds a `worker-gpu` service that runs the Celery worker on an AMD GPU via
-# ROCm.  The default CPU stack (docker-compose.yml) is unaffected.
+# Primary target: WSL2 + AMD Adrenalin driver ≥ 23.40.27.06
+#   The GPU is exposed via the DXG bridge (/dev/dxg) that the Windows AMD
+#   driver creates inside the WSL2 hypervisor.  ROCm accesses it through
+#   the HIP/DirectX 12 translation layer.
 #
-# ── Usage ────────────────────────────────────────────────────────────────────
+# Secondary target: native Linux with ROCm 6.x
+#   Swap the `devices` block as documented in the "Device passthrough"
+#   section near the bottom of this file.
 #
-#   Native Linux (RDNA2/RDNA3, ROCm 6.x):
+# ── Usage ─────────────────────────────────────────────────────────────────────
+#
+#   WSL2  (primary — AMD Adrenalin ≥ 23.40.27.06 on the Windows host):
 #     docker compose -f docker-compose.yml -f docker-compose.gpu.yml \
 #       up worker-gpu
 #
-#   WSL2 (DXG bridge, experimental — requires AMD Adrenalin 23.40.27.06+):
-#     HSA_OVERRIDE_GFX_VERSION=11.0.0 \
+#   Native Linux  (ROCm 6.x, RDNA2/RDNA3):
+#     HSA_OVERRIDE_GFX_VERSION=10.3.0 \           # RDNA2; use 11.0.0 for RDNA3
 #     docker compose -f docker-compose.yml -f docker-compose.gpu.yml \
 #       up worker-gpu
 #
-# ── Prerequisites ─────────────────────────────────────────────────────────────
+# ── Quick diagnostics ─────────────────────────────────────────────────────────
 #
-#   Native Linux:
-#     - ROCm 6.x stack installed on the host
-#     - Host user in `render` and `video` groups:
-#         sudo usermod -aG render,video $USER
-#     - Devices /dev/kfd and /dev/dri/renderD* present
+#   Verify GPU is visible inside the container:
+#     docker exec pwr_worker_gpu python -c \
+#       "import torch; print(torch.cuda.get_device_name(0))"
 #
-#   WSL2:
-#     - AMD Adrenalin driver ≥ 23.40.27.06 installed on the Windows host
-#     - /dev/dxg present inside WSL2 (auto-created by the driver)
-#     - ROCm support inside WSL2 is EXPERIMENTAL; results may vary
+#   Check worker warmup in logs:
+#     docker logs pwr_worker_gpu | grep 'GPU WARMUP'
 #
 # ── CPU Fallback guarantee ────────────────────────────────────────────────────
 #
-#   The standard `worker` service (docker-compose.yml) is never modified by
-#   this file.  All GPU-specific configuration lives exclusively in
-#   `worker-gpu`.  Running `docker compose up` (without -f override) always
-#   starts the pure-CPU stack.
+#   The standard `worker` service (docker-compose.yml) is never touched by
+#   this override.  Running `docker compose up` (no -f) always starts the
+#   pure-CPU stack.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -41,11 +42,9 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile.gpu
-    container_name: pwr_worker_gpu
+    container_name: sensor_worker_gpu
     restart: unless-stopped
 
-    # Override the Celery command to advertise GPU queue and enable
-    # PyTorch / ROCm backend for the tensor solver.
     command: >
       celery -A app.worker.celery_app worker
         --loglevel=info
@@ -56,35 +55,92 @@ services:
       - .env
 
     environment:
-      # ── Physics backend selection ──────────────────────────────────────
-      # tensor_solver.py reads PHYSICS_BACKEND to choose the array module:
-      #   torch  → PyTorch (ROCm or CUDA depending on runtime)
-      #   numpy  → plain NumPy on CPU (fallback if GPU init fails)
+      # ── Physics backend ───────────────────────────────────────────────────
+      # tensor_solver.py and assimilation.py check PHYSICS_BACKEND to decide
+      # which array module to use.  "torch" activates GPU-accelerated EnKF.
       PHYSICS_BACKEND: "torch"
 
-      # ── ROCm / HIP tuning ─────────────────────────────────────────────
-      # Force GFX IP version so HIP recognises the GPU even when the device
-      # string is not in the shipped device table.  Adjust to your RDNA gen:
-      #   RDNA1 (Navi 10/12/14)  → 10.1.0
-      #   RDNA2 (Navi 21..24)    → 10.3.0
-      #   RDNA3 (Navi 31..33)    → 11.0.0
+      # ── Library search path ───────────────────────────────────────────────
+      # Order matters:
+      #   1. /usr/lib/wsl/lib       — DXG / DirectML libraries (WSL2 bridge)
+      #   2. /opt/rocm/lib          — ROCm 6.x core runtime (libamdhip64 etc.)
+      #   3. /opt/rocm/hip/lib      — HIP runtime
+      #   4. /opt/rocm/opencl/lib   — OpenCL (required by some ROCm utilities)
+      #
+      # On WSL2 the DXG entry MUST come first so the AMD GPU driver exposes
+      # itself via /dev/dxg before the ROCm runtime searches for /dev/kfd.
+      LD_LIBRARY_PATH: >-
+        /usr/lib/wsl/lib:/opt/rocm/lib:/opt/rocm/hip/lib:/opt/rocm/opencl/lib
+
+      # ── ROCm / HIP device identification ─────────────────────────────────
+      # Forces the HIP runtime to treat the detected GFX IP as this version.
+      # Without this, ROCm may not recognise the GPU if the device string is
+      # absent from the shipped LLVM target table.
+      #
+      # Adjust to match your GPU generation:
+      #   RDNA1  (RX 5xxx, Navi 10/12/14)  → 10.1.0
+      #   RDNA2  (RX 6xxx, Navi 21-24)     → 10.3.0
+      #   RDNA3  (RX 7xxx, Navi 31-33)     → 11.0.0
       HSA_OVERRIDE_GFX_VERSION: "11.0.0"
 
-      # ── WSL2 DXG bridge ───────────────────────────────────────────────
-      # Instructs HSA runtime to detect GPU via the /dev/dxg interface
-      # exposed by the Windows AMD driver under WSL2.
+      # ── WSL2 DXG bridge ───────────────────────────────────────────────────
+      # Instructs the HSA runtime to enumerate GPUs via the /dev/dxg
+      # interface (the DXG kernel driver exposed by the Windows AMD Adrenalin
+      # driver in WSL2) instead of /dev/kfd (not present on WSL2).
       HSA_ENABLE_DXG_DETECTION: "1"
 
-      # Disable GPU kernel caching to ensure clean ROCm init on WSL2.
+      # ── ROCm / HIP path anchors ───────────────────────────────────────────
+      # Some HIP utilities resolve library paths relative to these variables.
+      ROCM_PATH: "/opt/rocm"
+      HIP_PATH:  "/opt/rocm"
+
+      # ── Kernel serialisation (WSL2 stability) ────────────────────────────
+      # AMD_SERIALIZE_KERNEL=3 forces all GPU kernels to execute serially,
+      # preventing race conditions in the DXG translation layer under WSL2.
+      # This has a minor throughput cost (~2-5%) but significantly reduces
+      # the chance of GPU hangs on first-launch under WSL2.
       AMD_SERIALIZE_KERNEL: "3"
 
-      # ── HIP / ROCm path hints ─────────────────────────────────────────
-      ROCM_PATH: "/opt/rocm"
-      HIP_PATH: "/opt/rocm"
-      LD_LIBRARY_PATH: "/usr/lib/wsl/lib"
+      # ── PyTorch memory allocator ─────────────────────────────────────────
+      # Limits the maximum block size the caching allocator splits in one
+      # operation.  Prevents fragmentation when rapidly allocating/freeing
+      # large ensemble tensors (N=100 000 × 9 × float32 ≈ 3.4 MB per tensor).
+      # 512 MB is a safe ceiling for 8 GB VRAM; raise to 1024 on 16+ GB cards.
+      PYTORCH_HIP_ALLOC_CONF: "max_split_size_mb:512"
+
+      # ── HIP command queue depth ───────────────────────────────────────────
+      # Up to 8 hardware queues allow async kernel dispatch for the RK4
+      # sub-step sequence (k1, k2, k3, k4 can overlap with memory ops).
+      GPU_MAX_HW_QUEUES: "8"
+
+      # ── Python runtime ────────────────────────────────────────────────────
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: "/app"
+
+    # ── Shared memory and locked pages ────────────────────────────────────────
+    #
+    # shm_size: required by PyTorch DataLoader workers and some inter-process
+    #   tensor sharing operations.  4 GB is ample for this workload.
+    #
+    # memlock: GPU DMA transfers require pinned (locked) host memory.
+    #   -1 means unlimited; necessary for large tensor transfers on ROCm.
+    #   Without this, large ensemble allocations can fail with ENOMEM.
+    shm_size: "4gb"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      # Stack size for HIP runtime threads
+      stack:
+        soft: 67108864   # 64 MB
+        hard: 67108864
 
     volumes:
+      # Application source (bind-mount for hot-reload during development)
       - ./backend:/app
+      # WSL2 DXG / DirectML runtime libraries from the host driver.
+      # Read-only: the container must not modify these host-owned libraries.
       - /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro
 
     depends_on:
@@ -93,37 +149,61 @@ services:
       redis:
         condition: service_healthy
 
-    # ── Device passthrough ────────────────────────────────────────────────
+    # ── Log rotation ──────────────────────────────────────────────────────────
+    # Prevent GPU worker logs from filling the host disk during long runs.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels:  "service=pwr-worker-gpu"
+
+    # ── Health check ──────────────────────────────────────────────────────────
+    # Verifies:
+    #   a) Python can import torch without errors.
+    #   b) torch.cuda.is_available() returns True (GPU visible to ROCm).
+    #   c) A small tensor operation completes without crashing.
     #
-    # Native Linux:  uncomment the block below (default).
-    # WSL2:          comment out `devices` and uncomment `volumes` + `dxg`
-    #                block further down.
+    # start_period gives the worker time to:
+    #   • Download / load ROCm HIP kernels (~30-60 s on first launch)
+    #   • Connect to Redis broker
+    #   • Run the GPU warmup routine in celery_app.py
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - >-
+          import torch, sys;
+          ok = torch.cuda.is_available();
+          t = torch.ones(16, device='cuda') if ok else None;
+          print('GPU OK:', torch.cuda.get_device_name(0) if ok else 'CPU-ONLY');
+          sys.exit(0 if ok else 1)
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 90s
+
+    # ── Device passthrough ────────────────────────────────────────────────────
     #
-    # NOTE: Docker Compose `devices` requires Docker Engine ≥ 19.03.
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │  WSL2 (default — active below)                                      │
+    # │  The GPU is exposed via /dev/dxg (DXG kernel driver).               │
+    # │  No /dev/kfd or /dev/dri is present in WSL2 kernels.               │
+    # └─────────────────────────────────────────────────────────────────────┘
     devices:
-      # HSA kernel driver — required for ROCm runtime
-      #- /dev/kfd
-      # DRM render nodes — typically renderD128, renderD129, ...
-      #- /dev/dri
       - /dev/dxg:/dev/dxg
 
-    group_add:
-      # Grants the container user access to GPU render and video devices
-      - render
-      - video
-
-    # ── WSL2 alternative device access ───────────────────────────────────
-    # On WSL2 the AMD GPU is exposed via /dev/dxg (DirectX Graphics adapter).
-    # Un-comment these lines and comment out `devices` above when running on
-    # WSL2 with the DXG bridge enabled.
-    #
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │  Native Linux (ROCm 6.x — comment out `devices` above and          │
+    # │  uncomment the block below)                                         │
+    # │                                                                     │
+    # │  Prerequisites:                                                     │
+    # │    sudo usermod -aG render,video $USER  (then log out/in)          │
+    # └─────────────────────────────────────────────────────────────────────┘
     # devices:
-    #   - /dev/dxg
-    # volumes:
-    #   - ./backend:/app
-    #   # D3D12 cache shared with the host driver (WSL2 only)
-    #   - /tmp/.X11-unix:/tmp/.X11-unix:rw
-
-    # Expose Flower or custom GPU metric port if desired
-    # ports:
-    #   - "5556:5556"
+    #   - /dev/kfd            # HSA kernel fusion driver (mandatory for ROCm)
+    #   - /dev/dri            # DRM render nodes (renderD128, renderD129 …)
+    # group_add:
+    #   - render              # access to /dev/dri/renderD*
+    #   - video               # access to /dev/dri/card*

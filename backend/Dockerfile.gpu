@@ -9,7 +9,7 @@
 #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml build worker-gpu
 #
 # The rocm/pytorch image bundles a conda environment whose Python interpreter
-# is typically 3.11.  Our app is compatible with 3.11+ (no 3.12-only syntax).
+# is typically 3.11. Our app is compatible with 3.11+ (no 3.12-only syntax).
 # ─────────────────────────────────────────────────────────────────────────────
 
 FROM rocm/pytorch:latest AS gpu-runtime
@@ -23,16 +23,14 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 WORKDIR /app
 
 # ── Install application dependencies ────────────────────────────────────────
-# We install into the *system* (conda-base) Python that comes with the ROCm
-# image, NOT into an isolated venv, so that PyTorch's ROCm libraries remain
-# visible to all packages.
-# `uv pip install --system` bypasses the venv requirement for this purpose.
+# Inyectamos el entorno de Conda de la imagen de AMD en el PATH del sistema
+# para que Celery y nuestro código vean el PyTorch preinstalado.
+ENV PATH="/opt/conda/bin:$PATH"
+
 COPY pyproject.toml ./
 
-# Install all [project.dependencies] into the base Python env.
-# Torch is already installed by the base image; uv will skip it if versions
-# are compatible or upgrade in-place if needed.
-RUN uv pip install --system --break-system-packages --no-cache -r pyproject.toml
+# Obligamos a uv a instalar los paquetes usando estrictamente el Python de Conda.
+RUN uv pip install --python /opt/conda/bin/python --no-cache -r pyproject.toml
 
 # ── Copy application source ──────────────────────────────────────────────────
 COPY . .
