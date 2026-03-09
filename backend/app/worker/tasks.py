@@ -36,6 +36,7 @@ kept only for the small number of Run metadata reads/writes.
 from __future__ import annotations
 
 import math
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -52,6 +53,14 @@ from app.physics import ReactorParams, ScipySolver
 from app.worker.celery_app import celery_app
 
 logger = get_task_logger(__name__)
+
+# ── Smart Switch threshold ────────────────────────────────────────────────────
+# Below this ensemble size the PCIe H2D transfer overhead and HIP kernel-launch
+# latency (~60–100 µs/dispatch) exceed the GPU compute savings.  Empirical
+# crossover on RX 7900 XT (HBM2e 800 GB/s vs DDR5-6000 96 GB/s) falls between
+# N = 50 000 and N = 80 000.  The conservative lower bound is used here.
+# See docs/overhead_analysis.md for the full analytical model.
+_GPU_ENSEMBLE_THRESHOLD: int = 50_000
 
 # ── SQL for bulk virtual-sensor inserts ───────────────────────────────────────
 # Used with psycopg2 execute_values — %s is replaced by the VALUES clause.
@@ -274,14 +283,39 @@ def run_virtual_sensor_job(
             f"Original error: {exc}"
         ) from exc
 
-    # Auto-fallback: if CUDA/ROCm was requested but is not available, use CPU.
+    # ── Smart Switch: select compute device based on ensemble size ────────────
+    # The PCIe H2D transfer overhead and HIP kernel-launch latency dominate for
+    # small ensembles, making CPU faster in total wall-clock time.
+    # See docs/overhead_analysis.md for the full justification.
     import torch as _torch
-    if device == "cuda" and not _torch.cuda.is_available():
+
+    if ensemble_size < _GPU_ENSEMBLE_THRESHOLD:
+        effective_device: str = "cpu"
+        device_reason: str = (
+            "Tamaño de ensamble óptimo para CPU. "
+            "Previene overhead de transferencia PCIe."
+        )
+    else:
+        effective_device = "cuda"
+        device_reason = "Tamaño masivo. Aceleración GPU habilitada."
+
+    # Hardware availability override: if GPU was selected but is not present,
+    # fall back to CPU and append a diagnostic note to the reason string.
+    if effective_device == "cuda" and not _torch.cuda.is_available():
         logger.warning(
-            "run_id=%s: CUDA/ROCm not available — falling back to device='cpu'",
+            "run_id=%s: CUDA/ROCm no disponible — fallback a device='cpu'",
             run_id,
         )
-        device = "cpu"
+        effective_device = "cpu"
+        device_reason = (
+            "Tamaño masivo (GPU solicitada), pero CUDA/ROCm no disponible "
+            "en tiempo de ejecución. Fallback a CPU."
+        )
+
+    logger.info(
+        "run_id=%s: Smart Switch → device=%s | N=%d | reason: %s",
+        run_id, effective_device, ensemble_size, device_reason,
+    )
 
     if enkf_obs_noise_var_K2 is None:
         enkf_obs_noise_var_K2 = obs_noise_std_K ** 2
@@ -333,11 +367,15 @@ def run_virtual_sensor_job(
         noisy_tc_np = true_tc_np + noise_np          # (n_steps,) noisy observations
 
         # ── 4. Initialise GPU ensemble + EnKF sensor ─────────────────────────
+        # Start the simulation timer here: the ground-truth ScipySolver run
+        # (step 2) is preprocessing; only the EnKF execution is timed.
+        t_sim_start: float = time.perf_counter()
+
         logger.info(
             "run_id=%s: initialising EnsembleSolver (N=%d, device=%s)",
-            run_id, ensemble_size, device,
+            run_id, ensemble_size, effective_device,
         )
-        solver = EnsembleSolver(N=ensemble_size, device=device)
+        solver = EnsembleSolver(N=ensemble_size, device=effective_device)
         solver.initialize(
             params,
             noise=NoiseConfig(
@@ -431,24 +469,34 @@ def run_virtual_sensor_job(
         raw_conn.close()
         raw_conn = None
 
+        # Stop the simulation timer immediately after all I/O is complete.
+        execution_time_s: float = time.perf_counter() - t_sim_start
+
         # ── 7. Compute RMSE and transition to completed ───────────────────────
         finite_sq = [e for e in sq_errors if math.isfinite(e)]
         rmse_K = math.sqrt(sum(finite_sq) / len(finite_sq)) if finite_sq else float('nan')
         logger.info(
-            "run_id=%s: assimilation done — %d rows stored, RMSE=%.4f K",
-            run_id, rows_inserted, rmse_K,
+            "run_id=%s: assimilation done — %d rows stored, RMSE=%.4f K, "
+            "device=%s, elapsed=%.2f s",
+            run_id, rows_inserted, rmse_K, effective_device, execution_time_s,
         )
 
-        run_obj.status     = "completed"
-        run_obj.completed_at = datetime.now(timezone.utc)
+        run_obj.status         = "completed"
+        run_obj.completed_at   = datetime.now(timezone.utc)
+        run_obj.execution_time = execution_time_s
+        run_obj.device_used    = effective_device
+        run_obj.device_reason  = device_reason
         db.commit()
         logger.info("run_id=%s [virtual_sensor]: status → completed", run_id)
 
         return {
-            "status":   "completed",
-            "run_id":   run_id,
-            "points":   rows_inserted,
-            "rmse_K":   rmse_K,
+            "status":           "completed",
+            "run_id":           run_id,
+            "points":           rows_inserted,
+            "rmse_K":           rmse_K,
+            "execution_time_s": execution_time_s,
+            "device_used":      effective_device,
+            "device_reason":    device_reason,
         }
 
     except Exception as exc:

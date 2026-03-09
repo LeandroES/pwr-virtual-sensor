@@ -401,4 +401,7 @@ def get_sensor_results(
         point_count=len(data),
         truncated=truncated,
         data=data,
+        execution_time=run.execution_time,
+        device_used=run.device_used,
+        device_reason=run.device_reason,
     )

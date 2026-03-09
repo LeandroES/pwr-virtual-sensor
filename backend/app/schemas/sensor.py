@@ -311,6 +311,31 @@ class SensorResultsResponse(BaseModel):
     )
     data:              list[SensorResultPoint]
 
+    # Smart Switch execution telemetry (null while the job is in progress)
+    execution_time: float | None = Field(
+        default=None,
+        description=(
+            "Wall-clock duration of the EnKF simulation phase [s], measured "
+            "from EnsembleSolver initialisation to final DB flush.  "
+            "Null while the job is pending or running."
+        ),
+    )
+    device_used: str | None = Field(
+        default=None,
+        description=(
+            "Compute device selected by the Smart Switch: 'cuda' or 'cpu'.  "
+            "Determined by the ensemble-size threshold (N < 50 000 → 'cpu'; "
+            "N ≥ 50 000 → 'cuda'), with a hardware availability override."
+        ),
+    )
+    device_reason: str | None = Field(
+        default=None,
+        description=(
+            "Human-readable explanation for the device selection decision.  "
+            "Populated on completion."
+        ),
+    )
+
 
 # ── GET /sensor/{job_id}/status (lightweight poll) ────────────────────────────
 
@@ -334,3 +359,27 @@ class SensorJobStatus(BaseModel):
     time_span_start:     float
     time_span_end:       float
     dt:                  float
+
+    # Smart Switch execution telemetry (null until the job completes)
+    execution_time: float | None = Field(
+        default=None,
+        description=(
+            "Wall-clock duration of the EnKF simulation phase [s], measured "
+            "from EnsembleSolver initialisation to final DB flush.  "
+            "Null while the job is pending or running."
+        ),
+    )
+    device_used: str | None = Field(
+        default=None,
+        description=(
+            "Compute device selected by the Smart Switch: 'cuda' or 'cpu'.  "
+            "Null while the job is pending."
+        ),
+    )
+    device_reason: str | None = Field(
+        default=None,
+        description=(
+            "Human-readable explanation for the device selection decision.  "
+            "Null while the job is pending."
+        ),
+    )

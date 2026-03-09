@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Double, String, Text
+from sqlalchemy import DateTime, Double, Float, String, Text
 from sqlalchemy.dialects.postgresql import UUID as PgUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -72,6 +72,26 @@ class Run(Base):
         Double,
         nullable=False,
         comment="Output time step [s]",
+    )
+
+    # ── Execution telemetry (populated on completion) ─────────────────────────
+    execution_time: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+        default=None,
+        comment="Wall-clock duration of the simulation phase [s] (perf_counter)",
+    )
+    device_used: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+        default=None,
+        comment="Compute device selected by the smart switch: 'cuda' or 'cpu'",
+    )
+    device_reason: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        default=None,
+        comment="Human-readable explanation for the device selection decision",
     )
 
     def __repr__(self) -> str:
