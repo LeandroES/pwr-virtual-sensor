@@ -2,52 +2,35 @@
 #
 # PWR Digital Twin — GPU Worker image (AMD ROCm / PyTorch)
 #
-# Base image: rocm/pytorch ships ROCm 6.x + PyTorch pre-built for AMD GPUs
-# inside a Conda-managed Python environment.
+# ── rocm/pytorch:latest layout (confirmed 2026-03) ───────────────────────────
+#   Base OS   : Ubuntu
+#   Python    : CPython 3.12.3
+#   Venv      : /opt/venv  — pre-created by AMD; /opt/venv/bin is in PATH
+#   torch     : 2.10.0+rocm7.2.0  — already installed in /opt/venv
 #
-# Problem with naive uv usage
-# ─────────────────────────────
-# uv refuses to install directly into a Conda Python interpreter:
+# ── Installation strategy ────────────────────────────────────────────────────
+#   The image already has a venv at /opt/venv with torch+ROCm.
+#   We install ONLY the application dependencies (fastapi, celery, etc.)
+#   into that existing venv using `uv pip install -r pyproject.toml`.
+#   torch is in [project.optional-dependencies].gpu — not in core deps —
+#   so it is never touched by this step.
 #
-#   ERROR: No virtual environment or system Python installation found
-#          for path /opt/conda/bin/python
+# ── Runtime crash prevention ─────────────────────────────────────────────────
+#   The ROCm HSA runtime (libhsa-runtime64.so) raises SIGSEGV (exit 139)
+#   when hsaKmtOpenKFD is called but neither librocdxg.so (WSL2 DXG bridge)
+#   nor /dev/kfd (native KFD) is available. This happens the moment torch
+#   is imported and tries to enumerate HIP devices.
 #
-# uv distinguishes between:
-#   • System Python  — installed by the OS package manager (apt, rpm, brew)
-#   • Virtual env    — created by venv / uv venv / virtualenv
-#   • Conda Python   — managed by Conda; treated as neither of the above
-#
-# uv will never install into a Conda Python directly because Conda manages
-# its own dependency graph; cross-tool interference could corrupt the env.
-#
-# Solution: --system-site-packages venv
-# ──────────────────────────────────────
-# We create a proper virtual environment with:
-#
-#   uv venv /opt/venv --python /opt/conda/bin/python --system-site-packages
-#
-# The --system-site-packages flag makes /opt/venv inherit every package
-# already installed in Conda's site-packages — critically including
-# torch, torchvision, and all ROCm/HIP shared-library bindings.
-#
-# We then activate this venv by prepending /opt/venv/bin to PATH.
-# uv auto-detects the active virtual environment via PATH, so subsequent
-# `uv pip install` calls target /opt/venv without any --python flag.
-#
-# Result: /opt/venv/bin/python sees both
-#   • /opt/venv/lib/python*/site-packages/   — our app dependencies
-#   • /opt/conda/lib/python*/site-packages/  — torch + ROCm (read-only link)
-#
-# torch is NOT listed in [project.dependencies] (only in [project.optional-
-# dependencies].gpu), so `uv pip install -r pyproject.toml` never attempts
-# to reinstall or overwrite the Conda-managed torch installation.
+#   docker-entrypoint-gpu.sh detects this condition before Celery starts and
+#   exports HIP_VISIBLE_DEVICES=-1, which prevents hipGetDeviceCount() from
+#   calling hsaInit() at all, avoiding the crash entirely.
 #
 # Build:
 #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml build worker-gpu
 #
-# Verify GPU access inside the container:
-#   docker exec sensor_worker_gpu python -c \
-#     "import torch; print(torch.cuda.get_device_name(0))"
+# Smoke-test (GPU available):
+#   docker exec sensor_worker_gpu python3 -c \
+#     "import torch; print('GPU:', torch.cuda.get_device_name(0))"
 # ─────────────────────────────────────────────────────────────────────────────
 
 FROM rocm/pytorch:latest AS gpu-runtime
@@ -56,90 +39,58 @@ LABEL maintainer="pwr-twin-team"
 LABEL description="PWR Digital Twin — GPU Worker (ROCm/PyTorch)"
 
 # ── Install uv ────────────────────────────────────────────────────────────────
-# Copy the statically-linked uv binary from the official upstream image.
-# This is faster and more reproducible than `pip install uv` or curl|sh.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 WORKDIR /app
 
-# ── Stage 1: Create the application virtual environment ───────────────────────
-#
-# --python /opt/conda/bin/python
-#     Explicitly targets the Conda-managed Python that ships with the
-#     rocm/pytorch base image. uv will use this interpreter to initialise
-#     the venv, making the venv's Python ABI-compatible with Conda's torch.
-#
-# --system-site-packages
-#     Causes the new venv to include Conda's site-packages in its sys.path.
-#     This is the key flag: torch, hip runtime bindings, and all ROCm
-#     Python wheels installed by AMD's image become visible to /opt/venv
-#     without copying or reinstalling them.
-#
-# No --seed flag is needed; uv venv always seeds pip/wheel by default.
+# ── Target the pre-existing venv ─────────────────────────────────────────────
+# The rocm/pytorch image already has /opt/venv in PATH; we also set
+# VIRTUAL_ENV so uv installs into it without needing any `uv venv` call.
+ENV VIRTUAL_ENV="/opt/venv" \
+    PATH="/opt/venv/bin:$PATH"
+
+# ── Install application dependencies ─────────────────────────────────────────
 COPY pyproject.toml ./
-RUN uv venv /opt/venv \
-        --python /opt/conda/bin/python \
-        --system-site-packages
-
-# ── Stage 2: Activate the venv ────────────────────────────────────────────────
-#
-# Prepending /opt/venv/bin to PATH is the standard activation mechanism.
-# All subsequent RUN, CMD, and ENTRYPOINT instructions will use the venv's
-# Python and pip without needing an explicit `source activate` call.
-#
-# uv detects the active venv via:
-#   1. VIRTUAL_ENV environment variable (not needed — PATH is sufficient)
-#   2. Walking up the PATH to find the first directory containing pyvenv.cfg
-#
-# /opt/conda/bin is kept in PATH so that Conda CLI tools (conda, mamba)
-# and ROCm utilities (rocm-smi, hipcc) remain accessible.
-ENV PATH="/opt/venv/bin:/opt/conda/bin:$PATH"
-
-# ── Stage 3: Install application dependencies ─────────────────────────────────
-#
-# `uv pip install -r pyproject.toml` reads [project.dependencies] and installs:
-#   fastapi, uvicorn, celery, redis, sqlalchemy, psycopg2-binary,
-#   scipy, numpy, pydantic, pydantic-settings, alembic
-#
-# torch is intentionally NOT installed here:
-#   • It lives in [project.optional-dependencies].gpu, not [project.dependencies]
-#   • It is already visible via --system-site-packages (Conda's torch+ROCm)
-#   • Reinstalling it would overwrite the ROCm-specific HIP binaries with a
-#     generic CUDA-only wheel, breaking GPU access
-#
-# --no-cache: avoids writing the uv HTTP cache to the image layer, keeping
-#   the final image smaller. The cache is not useful in a build context.
 RUN uv pip install --no-cache -r pyproject.toml
 
-# ── Stage 4: Copy application source ─────────────────────────────────────────
-# Done after dependency installation so the dep layer is cached separately.
-# Changing app source code does not invalidate the (slow) install layer.
+# ── Build-time sanity check ───────────────────────────────────────────────────
+# Verifies torch+ROCm survived the install and core app packages are present.
+RUN python3 -c "\
+import torch, fastapi, celery, sqlalchemy; \
+print('[build-check] python :', __import__('sys').version.split()[0]); \
+print('[build-check] torch  :', torch.__version__); \
+print('[build-check] rocm   :', getattr(torch.version, 'hip', None) or 'N/A'); \
+print('[build-check] fastapi:', fastapi.__version__); \
+print('[build-check] celery :', celery.__version__); \
+"
+
+# ── Copy application source ───────────────────────────────────────────────────
 COPY . .
 
-# ── Runtime environment variables ─────────────────────────────────────────────
+# ── GPU pre-check entrypoint ──────────────────────────────────────────────────
+# docker-entrypoint-gpu.sh runs BEFORE Celery starts.
+# It detects whether /dev/dxg + librocdxg.so (WSL2) or /dev/kfd (Linux)
+# is available, and exports HIP_VISIBLE_DEVICES=-1 when neither is found,
+# preventing the ROCm HSA runtime from segfaulting on first torch import.
+#
+# ENTRYPOINT calls bash explicitly — do NOT use ENTRYPOINT ["/app/docker-entrypoint-gpu.sh"].
+# On WSL2 + Docker BuildKit the execute bit set by a prior RUN chmod layer is
+# sometimes not reflected in the overlay mount at container init time, which
+# causes "permission denied" even though the build succeeded.  Invoking bash
+# directly bypasses the execute-bit requirement entirely.
+ENTRYPOINT ["bash", "/app/docker-entrypoint-gpu.sh"]
+
+# ── Runtime environment ───────────────────────────────────────────────────────
 ENV \
-    # Python runtime hygiene
     PYTHONDONTWRITEBYTECODE="1" \
     PYTHONUNBUFFERED="1" \
     PYTHONPATH="/app" \
-    \
-    # PyTorch / ROCm backend selection for tensor_solver.py and assimilation.py
     PHYSICS_BACKEND="torch" \
-    \
-    # ROCm installation root — referenced by HIP runtime and rocBLAS
     ROCM_PATH="/opt/rocm" \
     HIP_PATH="/opt/rocm" \
-    \
-    # Suppress verbose HIP JIT log messages (harmless, but noisy)
     AMD_LOG_LEVEL="0" \
-    \
-    # Library search path for the GPU container
-    # Order: WSL2 DXG bridge libs first, then ROCm runtime, then HIP, then OpenCL
-    # These are also set in docker-compose.gpu.yml (compose wins at runtime;
-    # this ENV provides a sane default when the image is run without compose)
     LD_LIBRARY_PATH="/usr/lib/wsl/lib:/opt/rocm/lib:/opt/rocm/hip/lib:/opt/rocm/opencl/lib"
 
-# ── Default command ───────────────────────────────────────────────────────────
-# Overridden by docker-compose.gpu.yml at runtime.
+# ── Default command (passed to the entrypoint) ────────────────────────────────
 CMD ["celery", "-A", "app.worker.celery_app", "worker", \
      "--loglevel=info", "--concurrency=2", "--queues=gpu,celery"]
