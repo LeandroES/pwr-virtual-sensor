@@ -6,7 +6,7 @@
 > carry ±15–40 K uncertainty under normal operation and ±80–200 K during transients.
 
 ---
-
+![img.png](img.png)
 ## The Problem This Project Solves
 
 The average fuel temperature in a PWR is one of the most safety-critical quantities in reactor
