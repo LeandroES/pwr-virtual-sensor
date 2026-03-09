@@ -56,11 +56,43 @@ logger = get_task_logger(__name__)
 
 # ── Smart Switch threshold ────────────────────────────────────────────────────
 # Below this ensemble size the PCIe H2D transfer overhead and HIP kernel-launch
-# latency (~60–100 µs/dispatch) exceed the GPU compute savings.  Empirical
-# crossover on RX 7900 XT (HBM2e 800 GB/s vs DDR5-6000 96 GB/s) falls between
-# N = 50 000 and N = 80 000.  The conservative lower bound is used here.
-# See docs/overhead_analysis.md for the full analytical model.
-_GPU_ENSEMBLE_THRESHOLD: int = 50_000
+# latency exceed the GPU compute savings on this specific hardware stack.
+#
+# Hardware context
+# ----------------
+#   GPU  : AMD RX 7900 XT — HBM2e, 800 GB/s, 84 CUs
+#   CPU  : AMD Ryzen 9 5950X — Zen 3, 16 cores
+#   RAM  : DDR4-3600 dual-channel, ~50 GB/s practical bandwidth
+#   OS   : WSL2 with AMD_SERIALIZE_KERNEL=3 (DXG bridge stability)
+#
+# Empirical calibration (measured, N = 100 000, GPU was 4× slower than CPU)
+# --------------------------------------------------------------------------
+# Back-calculating from the observation:
+#   t_cpu(N=100k) ≈ 72×100k / 50e9  = 144 µs
+#   t_gpu(N=100k) ≈ 72×100k / 800e9 =   9 µs  (compute only)
+#   measured ratio = 4× → t_gpu_total = 4 × 144 = 576 µs
+#   implied WSL2 overhead per step   = 576 - 9  = 567 µs
+#
+# Crossover N (where t_gpu_total = t_cpu):
+#   567 µs = (1/50e9 - 1/800e9) × 72 × N
+#   N_crossover ≈ 567e-6 / (1.44e-9 - 0.09e-9) ≈ 420 000
+#
+# The threshold is set at 250 000 — a conservative margin BELOW the crossover —
+# because the Smart Switch must err on the side of latency predictability:
+# activating the GPU too early costs 2–4× more wall-clock time; activating it
+# too late costs only a few percent throughput on the CPU path.
+#
+# Scientific context
+# ------------------
+# For the 9-dimensional PWR point-kinetics EnKF implemented here:
+#   N ≤  10 000  — operational / production range (filter statistically converged)
+#   N ≤ 100 000  — research-grade (covariance MC error < 0.3 %, overkill for d=9)
+#   N ≤ 500 000  — stress-test only; no scientific justification for d=9
+#
+# GPU becomes genuinely necessary only when the state dimension d is large
+# (e.g., multi-node spatial kinetics with d ≥ 100, or state-augmented EnKF
+# with d ≥ 30).  See docs/overhead_analysis.md for the full model.
+_GPU_ENSEMBLE_THRESHOLD: int = 250_000
 
 # ── SQL for bulk virtual-sensor inserts ───────────────────────────────────────
 # Used with psycopg2 execute_values — %s is replaced by the VALUES clause.

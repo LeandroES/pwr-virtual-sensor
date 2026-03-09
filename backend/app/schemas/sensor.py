@@ -12,10 +12,18 @@ Every numeric limit exists for a concrete physical or operational reason:
       Exceeding this causes silent numerical blow-up, not an obvious error.
 
   ensemble_size ≤ 500 000
-      Hard GPU-OOM guard.  At float32 precision, one (N, 9) state tensor
-      occupies N × 9 × 4 B.  For N = 500 000 and 6 RK4 scratch buffers,
-      total VRAM ≈ 108 MB — still safe on any modern GPU.  Beyond this the
-      risk of OOM errors grows rapidly (full P_f covariance matrix, etc.).
+      Hard VRAM guard.  At float32 precision, state (N,9) + 6 RK4 scratch
+      buffers + EnKF intermediates total ≈ 308 MB at N = 500 000 — safe on
+      any GPU with ≥ 1 GB VRAM.
+
+      Scientific tiers for the 9-dimensional PWR point-kinetics EnKF:
+        N ≤  10 000  — operational range; filter statistically converged
+                        (MC error in P_f ≈ 1 %, well below model error).
+        N ≤ 100 000  — research-grade; MC error < 0.3 %, overkill for d=9.
+        N ≤ 500 000  — stress-test / benchmarking only; no scientific
+                        justification for a 9-state filter.  Would be
+                        justified for multi-node spatial kinetics (d ≥ 100)
+                        or state-augmented EnKF (d ≥ 30).
 
   obs_noise_std_K ∈ [0.01, 50.0] K
       Lower bound: below 0.01 K the EnKF is essentially running a perfect
@@ -100,9 +108,11 @@ class SensorSimulateRequest(BaseModel):
         le=ENSEMBLE_SIZE_MAX,
         description=(
             f"Number of EnKF ensemble members N.  "
-            f"Range [{ENSEMBLE_SIZE_MIN}, {ENSEMBLE_SIZE_MAX}].  "
-            f"Hard upper limit protects GPU VRAM: at N = {ENSEMBLE_SIZE_MAX} "
-            "and float32, the state + RK4 scratch tensors occupy ~108 MB."
+            f"Range [{ENSEMBLE_SIZE_MIN:,}, {ENSEMBLE_SIZE_MAX:,}].  "
+            "Scientific tiers for this 9-dimensional PKE filter: "
+            "N ≤ 10,000 operational; N ≤ 100,000 research-grade; "
+            "N ≤ 500,000 stress-test only (no added filter quality for d=9).  "
+            f"VRAM at N = {ENSEMBLE_SIZE_MAX:,}: ~308 MB (float32, 6 RK4 scratch buffers)."
         ),
     )
 

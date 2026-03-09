@@ -2,14 +2,16 @@
 
 **Document type:** Architectural Decision Record — Performance Analysis
 **Component:** PWR Digital Twin — Ensemble Kalman Filter (EnKF) Physics Backend
-**Revision:** 1.0
+**Revision:** 1.1
 **Date:** 2026-03-09
 
 ---
 
 ## 1. Executive Summary
 
-This document quantifies the PCIe memory transfer overhead that governs the performance crossover between CPU and GPU execution for the ensemble physics solver (`EnsembleSolver`) of the PWR Digital Twin. Analytical and empirical evidence demonstrates that for ensemble sizes below approximately N = 50,000 members, host-to-device (H2D) and device-to-host (D2H) transfers over the PCIe bus constitute the dominant latency term, rendering CPU execution faster in total wall-clock time. The GPU (AMD RX 7900 XT) becomes the superior compute engine only for N >= 50,000, where its massively parallel arithmetic throughput decisively amortises the fixed transfer cost.
+This document quantifies the PCIe memory transfer overhead that governs the performance crossover between CPU and GPU execution for the ensemble physics solver (`EnsembleSolver`) of the PWR Digital Twin. Analytical modelling and empirical measurement demonstrate that for ensemble sizes below approximately N = 250,000 members, the WSL2 DXG bridge latency and HIP kernel serialisation overhead (`AMD_SERIALIZE_KERNEL=3`) together dominate the GPU execution time, rendering CPU execution faster in total wall-clock time on the specific hardware of this deployment (Ryzen 9 5950X / DDR4-3600 / RX 7900 XT / WSL2). The GPU becomes the superior compute engine only for N >= 250,000 on this stack.
+
+**Revision 1.1 note:** The initial revision used a DDR5-6000 CPU bandwidth figure (96 GB/s). The actual host memory subsystem is DDR4-3600 dual-channel (~50 GB/s practical), which significantly reduces CPU execution time per step and raises the empirical crossover. In addition, an empirical measurement at N = 100,000 (GPU 4× slower than CPU) was used to back-calculate the actual WSL2 DXG per-step overhead (~567 µs), replacing the theoretical 60–100 µs native-Linux estimate. All figures in this revision reflect the corrected values.
 
 ---
 
@@ -31,9 +33,12 @@ The computational cost of both stages scales linearly with N, but the arithmetic
 | PCIe bus version | PCIe 4.0 x16 | Motherboard specification |
 | PCIe 4.0 x16 theoretical peak | 32 GB/s bidirectional (16 GB/s per direction) | PCIe 4.0 specification |
 | PCIe 4.0 x16 sustained throughput | ~14 GB/s (H2D or D2H, measured, accounting for protocol overhead) | Empirical, AMD ROCm benchmark |
-| Host RAM bandwidth (DDR5-6000) | ~96 GB/s | CPU-Z / stream benchmark |
-| CPU model | AMD Ryzen 9 (host) | lscpu |
+| Host RAM | DDR4-3600 dual-channel, 64 GB (2 × 32 GB) | System specification |
+| Host RAM bandwidth (DDR4-3600, 2ch) | ~57.6 GB/s theoretical; ~50 GB/s practical | JEDEC DDR4 spec; stream benchmark |
+| CPU model | AMD Ryzen 9 5950X (Zen 3, 16 cores / 32 threads) | lscpu |
 | CPU peak FP32 throughput (AVX2) | ~1.5 TFLOP/s | Theoretical, 8-wide FP32 x 2 FMA |
+| WSL2 DXG per-step overhead (measured) | ~567 µs | Back-calculated from N=100k empirical measurement |
+| WSL2 configuration | AMD_SERIALIZE_KERNEL=3 (DXG bridge stability) | docker-compose.gpu.yml |
 
 ---
 
@@ -126,81 +131,104 @@ This overhead dominates over the compute time at N = 10,000:
 t_overhead ~= 80 us >> t_compute ~= 0.9 us   (N = 10,000)
 ```
 
-### 5.3 CPU Execution Time (Vectorised NumPy/SciPy Reference)
+### 5.3 CPU Execution Time (Ryzen 9 5950X, DDR4-3600)
 
-The ScipySolver runs per-member sequentially (single ensemble member). The EnsembleSolver on CPU uses PyTorch with AVX2 vectorisation over the N dimension. At approximately 1.5 TFLOP/s effective throughput with AVX2 FP32:
+The EnsembleSolver on CPU uses PyTorch with AVX2 vectorisation across the N members dimension, exploiting all 16 cores via the ATen thread pool. At DDR4-3600 dual-channel (~50 GB/s practical bandwidth), the workload is memory-bandwidth-bound:
 
 ```
-t_cpu_step(N) = 136N / (1.5e12) seconds
+t_cpu_mem(N) = 72N bytes / 50e9 = 1,440e-12 x N seconds
 ```
 
-For N = 10,000: t_cpu_step ~= 0.9 microseconds.
-No kernel dispatch overhead; NumPy/PyTorch CPU dispatches are approximately 1-2 microseconds.
+For N = 10,000:  t_cpu_mem ~= 14.4 microseconds.
+For N = 100,000: t_cpu_mem ~= 144 microseconds.
+For N = 250,000: t_cpu_mem ~= 360 microseconds.
+
+No kernel dispatch overhead; PyTorch CPU thread-pool dispatch is approximately 1-5 microseconds — negligible compared to memory transfer time.
+
+Note: DDR4-3600 dual-channel delivers ~2.3× less bandwidth than the DDR5-6000 figure used in revision 1.0 (96 GB/s). This materially increases CPU execution time per step and therefore raises the crossover N relative to the original estimate.
 
 ---
 
 ## 6. Performance Crossover Model
 
-The total wall-clock time per simulation step on GPU includes:
+### 6.1 Analytical Model
+
+The total wall-clock time per simulation step on GPU:
 
 ```
-T_gpu(N) = t_transfer_init(N) / n_steps + t_kernel_launch + t_compute_gpu(N)
+T_gpu(N) = t_overhead_wsl2 + t_compute_gpu(N)
+         = t_overhead_wsl2 + 72N / 800e9
 ```
 
-Where t_transfer_init(N) / n_steps amortises the one-time initialization transfer over all time steps, t_kernel_launch is the fixed per-step dispatch cost, and t_compute_gpu(N) is the memory-bound compute time.
+Where `t_overhead_wsl2` is the fixed per-step cost of the WSL2 DXG bridge dispatch, HIP runtime, and the serialisation imposed by `AMD_SERIALIZE_KERNEL=3`. On native Linux with /dev/kfd this term is 60–100 µs; on WSL2 DXG it is significantly higher.
 
-The total wall-clock time per step on CPU:
-
-```
-T_cpu(N) = t_compute_cpu(N)
-```
-
-Setting T_gpu(N) = T_cpu(N) and solving for the crossover N:
+The total wall-clock time per step on CPU (DDR4-3600 dual-channel, ~50 GB/s):
 
 ```
-t_kernel_launch + t_compute_gpu(N) = t_compute_cpu(N)
-
-80 us + 90e-12 x N = 90.7e-12 x N
+T_cpu(N) = 72N / 50e9 = 1,440e-12 x N seconds
 ```
 
-This yields a negative difference in compute terms (GPU is faster per flop), but the kernel launch overhead shifts the crossover:
+Crossover condition T_gpu(N*) = T_cpu(N*):
 
 ```
-80 us = (90.7e-12 - 90e-12) x N
-80 us = 0.7e-12 x N
-N = 80e-6 / 0.7e-12 = 114,000
+t_overhead_wsl2 + 90e-12 x N* = 1,440e-12 x N*
+t_overhead_wsl2 = (1,440e-12 - 90e-12) x N*
+t_overhead_wsl2 = 1,350e-12 x N*
+N* = t_overhead_wsl2 / 1,350e-12
 ```
 
-This estimate neglects that at larger N the GPU's 800 GB/s bandwidth vastly exceeds CPU DDR5 bandwidth (96 GB/s). Correcting for bandwidth-bound behaviour:
+### 6.2 Empirical Calibration
+
+A direct measurement was performed at N = 100,000 on this hardware stack. The GPU execution was observed to be 4× slower than CPU:
 
 ```
-t_cpu_mem(N)  = 72N / 96e9  = 750e-12 x N   (DDR5 bound)
-t_gpu_mem(N)  = 72N / 800e9 = 90e-12 x N    (HBM2e bound)
+t_cpu(N=100k)       = 1,440e-12 x 100,000  = 144 µs
+t_gpu_measured      = 4 x 144              = 576 µs
+t_overhead_wsl2     = 576 - 90             = 486 µs   (back-calculated)
+
+N* = 486e-6 / 1,350e-12  ~= 360,000
 ```
 
-Revised crossover:
+This places the empirical crossover at approximately N = 360,000. The Smart Switch threshold is set at **N = 250,000** — a 30 % conservative margin below the crossover — because the cost of activating the GPU too early (2–4× latency penalty) is greater than the cost of keeping the CPU path slightly longer than necessary.
 
-```
-80 us + 90e-12 x N = 750e-12 x N
-80 us = 660e-12 x N
-N = 80e-6 / 660e-12 ~= 121,000
-```
+### 6.3 GPU Speedup at Representative Ensemble Sizes
 
-Accounting for additional GPU advantages (tensor parallelism across the 84 Compute Units, FP32 throughput on VALU), the practical crossover observed experimentally falls between N = 50,000 and N = 80,000 depending on simulation duration and step count.
+| N | T_cpu (µs) | T_gpu (µs) | GPU vs CPU |
+|---|---|---|---|
+| 10,000 | 14 | 487 | 35× slower |
+| 100,000 | 144 | 495 | 3.4× slower |
+| 250,000 | 360 | 509 | 1.4× slower (threshold) |
+| 360,000 | 518 | 518 | break-even |
+| 500,000 | 720 | 531 | 1.4× faster |
+| 1,000,000 | 1,440 | 576 | 2.5× faster |
+
+Note that even at N = 1,000,000 the GPU advantage is modest (2.5×) due to the fixed WSL2 overhead. On native Linux with /dev/kfd (overhead ~80 µs) the GPU would be 15× faster at N = 1,000,000.
 
 ---
 
-## 7. Empirical Crossover Summary
+## 7. Device Selection Summary
 
-| Ensemble Size | Recommended Backend | Rationale |
+### 7.1 Performance Recommendation by Ensemble Size (this hardware stack)
+
+| N | Smart Switch decision | Scientific tier | Rationale |
+|---|---|---|---|
+| N < 10,000 | CPU | Operational | GPU 30–35× slower; filter statistically converged for d=9 |
+| 10,000 – 99,999 | CPU | Research-grade | GPU 3–10× slower; covariance MC error < 1 %, overkill for d=9 |
+| 100,000 – 249,999 | CPU | Stress-test | GPU still slower; no scientific justification for d=9 filter |
+| 250,000 – 359,999 | GPU | Stress-test | GPU begins recovering overhead margin; Smart Switch activates GPU |
+| 360,000 | GPU | Stress-test | Empirical break-even point on this hardware stack |
+| > 360,000 | GPU | Stress-test | GPU progressively faster; justified for augmented state or multi-node models |
+| 500,000 (max) | GPU | Stress-test | ~1.4× GPU advantage; VRAM usage ~308 MB (1.5 % of 20 GB) |
+
+### 7.2 Scientific Context
+
+The 9-dimensional point-kinetics EnKF implemented in this project reaches statistical convergence at N ≈ 1,000–5,000. Values above this threshold serve exclusively research or benchmarking purposes:
+
+| Range | Label | Justification |
 |---|---|---|
-| N < 10,000 | CPU (ScipySolver / PyTorch CPU) | Kernel launch overhead dominates; GPU provides no throughput advantage |
-| 10,000 <= N < 50,000 | CPU preferred | PCIe initialization cost + launch overhead not yet amortised over compute gains |
-| N ~= 50,000 | Break-even | Approximately equal wall-clock time; GPU preferred for thermal management |
-| N > 50,000 | GPU (EnsembleSolver, CUDA/ROCm) | HBM2e bandwidth advantage decisively exceeds PCIe + launch overheads |
-| N >= 100,000 | GPU mandatory | CPU DDR5 bandwidth becomes the binding constraint; GPU is 7-8x faster |
-
-The project default of N = 100,000 (`EnsembleSolver.__init__` default) was chosen to remain comfortably above the crossover while keeping VRAM consumption within budget (approximately 27 MB at float32, far below the 20 GB available on the RX 7900 XT).
+| N ≤ 10,000 | Operational | Industry standard for online core monitoring (EDF: N = 50–200; CEA/MIT research: N ≤ 2,000) |
+| N ≤ 100,000 | Research-grade | Monte Carlo error in P_f (9×9) below 0.3 %; standard for academic EnKF studies |
+| N ≤ 500,000 | Stress-test | No improvement in filter quality for d=9; justified only for hardware benchmarking or future model extensions with d ≥ 100 (spatial kinetics) |
 
 ---
 
@@ -210,9 +238,11 @@ The project default of N = 100,000 (`EnsembleSolver.__init__` default) was chose
 
 The `run_virtual_sensor_job` Celery task passes `device="cuda"` by default and falls back to `"cpu"` when `torch.cuda.is_available()` returns False. This is correct: the fallback is semantically sound but carries a performance penalty at large N that must be communicated to operators.
 
-### 8.2 Minimum Recommended N for GPU Deployment
+### 8.2 Smart Switch Threshold
 
-For production GPU deployments, ensemble sizes below N = 50,000 should not be routed to the GPU worker. The `SensorSimulateRequest` schema enforces a lower bound of N = 100 (safety OOM guard) but does not enforce the GPU-specific minimum. A future improvement would warn users when N < 50,000 is submitted to the GPU queue.
+The `_GPU_ENSEMBLE_THRESHOLD = 250_000` constant in `backend/app/worker/tasks.py` implements the device selection policy derived from Section 6. Ensemble sizes below this threshold are routed to CPU regardless of the `device` field in the API request. The threshold represents a 30 % margin below the empirical break-even (N ≈ 360,000) to ensure the CPU path is always taken when the GPU offers no meaningful advantage.
+
+To adjust the threshold for a different hardware stack, back-calculate the WSL2 overhead from a measurement at a known N (as in Section 6.2) and compute `N* = t_overhead / 1,350e-12`. Set the threshold to approximately 0.7 × N*.
 
 ### 8.3 dtype Considerations
 
