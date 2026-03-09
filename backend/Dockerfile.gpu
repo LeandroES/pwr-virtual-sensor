@@ -43,6 +43,20 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 WORKDIR /app
 
+# ── Install librocdxg (WSL2 DXG bridge for ROCm HSA runtime) ─────────────────
+# librocdxg.so is NOT bundled in rocm/pytorch:latest and is absent from the
+# ROCm apt repo included in the image.  We pre-compile it on the WSL2 host
+# (where Windows SDK headers + libdxcore.so are available) and ship the binary
+# directly in the Docker context under backend/libs/.
+#
+# At runtime it is loaded by libhsa-runtime64.so when HSA_ENABLE_DXG_DETECTION=1
+# and /dev/dxg is present.  libdxcore.so (the underlying Windows DXG kernel
+# interface) is resolved dynamically via dlopen() from /usr/lib/wsl/lib.
+COPY libs/librocdxg.so.1.1.0 /opt/rocm/lib/
+RUN ln -sf /opt/rocm/lib/librocdxg.so.1.1.0 /opt/rocm/lib/librocdxg.so.1 && \
+    ln -sf /opt/rocm/lib/librocdxg.so.1      /opt/rocm/lib/librocdxg.so  && \
+    ldconfig
+
 # ── Target the pre-existing venv ─────────────────────────────────────────────
 # The rocm/pytorch image already has /opt/venv in PATH; we also set
 # VIRTUAL_ENV so uv installs into it without needing any `uv venv` call.

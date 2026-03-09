@@ -38,9 +38,18 @@ GPU_MODE="none"
 
 # ── WSL2 DXG bridge check ──────────────────────────────────────────────────────
 DXG_DEVICE="/dev/dxg"
-DXG_LIB="/usr/lib/wsl/lib/librocdxg.so"
 
-if [ -c "${DXG_DEVICE}" ] && [ -f "${DXG_LIB}" ]; then
+# librocdxg.so may live in the WSL2 host-mounted path (AMD Adrenalin driver)
+# or in /opt/rocm/lib (compiled from source and baked into the image).
+DXG_LIB=""
+for _libdir in /usr/lib/wsl/lib /opt/rocm/lib /usr/local/lib; do
+    if [ -f "${_libdir}/librocdxg.so" ]; then
+        DXG_LIB="${_libdir}/librocdxg.so"
+        break
+    fi
+done
+
+if [ -c "${DXG_DEVICE}" ] && [ -n "${DXG_LIB}" ]; then
     GPU_MODE="wsl2-dxg"
 fi
 

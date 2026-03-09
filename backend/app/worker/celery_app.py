@@ -107,8 +107,22 @@ _WARMUP_STATE_DIM: int    = 9       # state vector dimension
 
 # GPU access interface paths
 _WSL2_DXG_DEVICE: str = "/dev/dxg"
-_WSL2_DXG_LIB:    str = "/usr/lib/wsl/lib/librocdxg.so"
 _LINUX_KFD:        str = "/dev/kfd"
+
+# librocdxg.so search order:
+#   1. /usr/lib/wsl/lib  — AMD Adrenalin driver installs it here on the host
+#   2. /opt/rocm/lib     — compiled from source and baked into the image
+#   3. /usr/local/lib    — generic fallback
+_WSL2_DXG_LIB_CANDIDATES: list[str] = [
+    "/usr/lib/wsl/lib/librocdxg.so",
+    "/opt/rocm/lib/librocdxg.so",
+    "/usr/local/lib/librocdxg.so",
+]
+
+
+def _find_rocdxg_lib() -> str | None:
+    """Return the first librocdxg.so path that exists, or None."""
+    return next((p for p in _WSL2_DXG_LIB_CANDIDATES if os.path.exists(p)), None)
 
 
 def _gpu_access_available() -> bool:
@@ -123,7 +137,7 @@ def _gpu_access_available() -> bool:
 
     Native Linux requires /dev/kfd (ROCm KFD kernel module).
     """
-    wsl2_ok  = os.path.exists(_WSL2_DXG_DEVICE) and os.path.exists(_WSL2_DXG_LIB)
+    wsl2_ok  = os.path.exists(_WSL2_DXG_DEVICE) and _find_rocdxg_lib() is not None
     linux_ok = os.path.exists(_LINUX_KFD)
     return wsl2_ok or linux_ok
 
@@ -144,16 +158,17 @@ def _warmup_gpu_cache(sender: Any, **kwargs: Any) -> None:
       • Pre-warm the caching allocator for EnsembleSolver tensor shapes.
     """
     # ── Layer 2: hardware pre-check ─────────────────────────────────────────
+    _rocdxg_found = _find_rocdxg_lib()
     if not _gpu_access_available():
         logger.info(
             "[GPU WARMUP] No GPU access interface detected:\n"
             "  WSL2  — %s: %s\n"
-            "          %s: %s\n"
+            "          librocdxg.so: %s\n"
             "  Linux — %s: %s\n"
             "Disabling HIP device enumeration (HIP_VISIBLE_DEVICES=-1) "
             "to prevent ROCm HSA runtime segfault. Worker → CPU-only mode.",
             _WSL2_DXG_DEVICE, "found" if os.path.exists(_WSL2_DXG_DEVICE) else "NOT FOUND",
-            _WSL2_DXG_LIB,    "found" if os.path.exists(_WSL2_DXG_LIB)    else "NOT FOUND",
+            _rocdxg_found or "NOT FOUND (searched: " + ", ".join(_WSL2_DXG_LIB_CANDIDATES) + ")",
             _LINUX_KFD,       "found" if os.path.exists(_LINUX_KFD)       else "NOT FOUND",
         )
         os.environ.setdefault("HIP_VISIBLE_DEVICES",  "-1")
@@ -163,11 +178,11 @@ def _warmup_gpu_cache(sender: Any, **kwargs: Any) -> None:
     logger.info(
         "[GPU WARMUP] GPU access interface detected:\n"
         "  WSL2  — %s: found\n"
-        "          %s: found\n"
+        "          librocdxg.so: %s\n"
         "  HSA_OVERRIDE_GFX_VERSION = %s\n"
         "  HSA_ENABLE_DXG_DETECTION = %s",
         _WSL2_DXG_DEVICE,
-        _WSL2_DXG_LIB,
+        _rocdxg_found,
         os.environ.get("HSA_OVERRIDE_GFX_VERSION", "(not set)"),
         os.environ.get("HSA_ENABLE_DXG_DETECTION", "(not set)"),
     )
