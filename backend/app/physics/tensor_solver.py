@@ -78,6 +78,7 @@ def _require_torch() -> None:
             "  pip install torch\n"
             "Then add 'torch' to pyproject.toml [project.optional-dependencies] gpu."
         )
+    print(f"PyTorch ROCm Status: is_available={torch.cuda.is_available()}", flush=True)
 
 
 def _no_grad(fn: Any) -> Any:

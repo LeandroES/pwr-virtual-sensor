@@ -48,6 +48,29 @@ import logging
 import os
 from typing import Any
 
+# ── ROCm / HIP environment hardening ─────────────────────────────────────────
+#
+# MUST run before any `import torch` anywhere in this process.
+#
+# These variables are safe to set unconditionally — they tune ROCm behaviour
+# but do NOT override the crash-protection logic in the entrypoint.
+#
+# CRITICAL: HIP_VISIBLE_DEVICES is intentionally NOT set here.
+# The shell entrypoint (docker-entrypoint-gpu.sh) sets it to "-1" when
+# librocdxg.so is absent.  Overriding that to "0" causes libhsa-runtime64.so
+# to call hsaInit() → hsaKmtOpenKFD, which is an undefined symbol without
+# librocdxg.so → SIGSEGV (exit 139).  The entrypoint's "-1" is the only
+# thing preventing the crash loop; it must not be touched here.
+#
+# To enable GPU support, install AMD Adrenalin driver ≥ 23.40.27.06 on the
+# Windows host and restart WSL2.  Verify with:
+#   ls /usr/lib/wsl/lib/librocdxg.so
+#
+os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+os.environ.setdefault("HSA_ENABLE_DXG_DETECTION", "1")
+os.environ.setdefault("ROCM_PATH",                "/opt/rocm")
+# ──────────────────────────────────────────────────────────────────────────────
+
 from celery import Celery
 from celery.signals import worker_ready
 from celery.utils.log import get_task_logger
@@ -90,11 +113,15 @@ _LINUX_KFD:        str = "/dev/kfd"
 
 def _gpu_access_available() -> bool:
     """
-    Return True if a ROCm-compatible GPU access interface is present.
+    Return True if a ROCm-compatible GPU access interface is fully present.
 
-    Checks in order:
-      1. WSL2 DXG bridge: /dev/dxg character device AND librocdxg.so library
-      2. Native Linux KFD: /dev/kfd character device
+    WSL2 requires BOTH /dev/dxg AND librocdxg.so.  The library provides
+    hsaKmtOpenKFD, which libhsa-runtime64.so.1 calls during hsaInit().
+    Without it the dynamic linker reports an undefined symbol and the process
+    exits with SIGSEGV (exit 139).  Checking for the device alone is not
+    sufficient — the library is the critical load-bearing component.
+
+    Native Linux requires /dev/kfd (ROCm KFD kernel module).
     """
     wsl2_ok  = os.path.exists(_WSL2_DXG_DEVICE) and os.path.exists(_WSL2_DXG_LIB)
     linux_ok = os.path.exists(_LINUX_KFD)
@@ -107,9 +134,8 @@ def _warmup_gpu_cache(sender: Any, **kwargs: Any) -> None:
     Pre-warm the GPU context once at worker startup (via worker_ready signal).
 
     Layer 2 protection: checks GPU hardware access before importing torch.
-    If the ROCm DXG bridge or KFD is unavailable, disables HIP device
-    enumeration and returns immediately — preventing the SIGSEGV that would
-    result from the HSA runtime trying to call the missing hsaKmtOpenKFD.
+    If no GPU interface is found at all, disables HIP device enumeration and
+    returns immediately — preventing the SIGSEGV from the HSA runtime.
 
     When GPU IS available, runs a (1024×1024) SGEMM to:
       • Force CUDA/ROCm context creation.
@@ -133,6 +159,18 @@ def _warmup_gpu_cache(sender: Any, **kwargs: Any) -> None:
         os.environ.setdefault("HIP_VISIBLE_DEVICES",  "-1")
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
         return
+
+    logger.info(
+        "[GPU WARMUP] GPU access interface detected:\n"
+        "  WSL2  — %s: found\n"
+        "          %s: found\n"
+        "  HSA_OVERRIDE_GFX_VERSION = %s\n"
+        "  HSA_ENABLE_DXG_DETECTION = %s",
+        _WSL2_DXG_DEVICE,
+        _WSL2_DXG_LIB,
+        os.environ.get("HSA_OVERRIDE_GFX_VERSION", "(not set)"),
+        os.environ.get("HSA_ENABLE_DXG_DETECTION", "(not set)"),
+    )
 
     # ── GPU access confirmed — proceed with torch warmup ────────────────────
     try:
