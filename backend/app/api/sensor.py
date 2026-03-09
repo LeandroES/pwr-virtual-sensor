@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, literal_column, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -104,12 +104,18 @@ def _compute_metrics(job_id: uuid.UUID, db: Session) -> SensorMetrics | None:
     """
     VST = VirtualSensorTelemetry
 
+    # PostgreSQL NaN ≠ NULL — COALESCE(NaN, 0) stays NaN.
+    # NULLIF(col, 'NaN'::float) converts NaN → NULL so AVG/SUM ignore it.
+    _nan = literal_column("'NaN'::float")
+    safe_inferred = func.nullif(VST.inferred_t_fuel_mean, _nan)
+    safe_true     = func.nullif(VST.true_t_fuel, _nan)
+
     # Derived expressions reused across aggregates
-    diff       = VST.inferred_t_fuel_mean - VST.true_t_fuel        # signed error
+    diff       = safe_inferred - safe_true                           # signed error (NULL if NaN)
     abs_diff   = func.abs(diff)
     sq_diff    = diff * diff                                         # squared error
-    one_sigma  = VST.inferred_t_fuel_std
-    two_sigma  = 2.0 * VST.inferred_t_fuel_std
+    one_sigma  = func.nullif(VST.inferred_t_fuel_std, _nan)
+    two_sigma  = 2.0 * func.nullif(VST.inferred_t_fuel_std, _nan)
 
     # Conditional indicators for coverage bands (1 if inside, 0 if outside)
     in_68 = case((abs_diff <= one_sigma, 1), else_=0)

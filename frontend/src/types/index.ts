@@ -46,11 +46,11 @@ export interface SensorResultPoint {
 
 export interface SensorMetrics {
   total_points: number
-  rmse_K: number
-  mae_K: number
-  coverage_68pct: number
-  coverage_95pct: number
-  mean_ensemble_std_K: number
+  rmse_K: number | null
+  mae_K: number | null
+  coverage_68pct: number | null
+  coverage_95pct: number | null
+  mean_ensemble_std_K: number | null
 }
 
 export interface SensorResultsResponse {

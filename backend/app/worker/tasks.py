@@ -274,6 +274,15 @@ def run_virtual_sensor_job(
             f"Original error: {exc}"
         ) from exc
 
+    # Auto-fallback: if CUDA/ROCm was requested but is not available, use CPU.
+    import torch as _torch
+    if device == "cuda" and not _torch.cuda.is_available():
+        logger.warning(
+            "run_id=%s: CUDA/ROCm not available — falling back to device='cpu'",
+            run_id,
+        )
+        device = "cpu"
+
     if enkf_obs_noise_var_K2 is None:
         enkf_obs_noise_var_K2 = obs_noise_std_K ** 2
 
@@ -423,7 +432,8 @@ def run_virtual_sensor_job(
         raw_conn = None
 
         # ── 7. Compute RMSE and transition to completed ───────────────────────
-        rmse_K = math.sqrt(sum(sq_errors) / len(sq_errors))
+        finite_sq = [e for e in sq_errors if math.isfinite(e)]
+        rmse_K = math.sqrt(sum(finite_sq) / len(finite_sq)) if finite_sq else float('nan')
         logger.info(
             "run_id=%s: assimilation done — %d rows stored, RMSE=%.4f K",
             run_id, rows_inserted, rmse_K,

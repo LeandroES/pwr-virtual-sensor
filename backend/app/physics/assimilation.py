@@ -410,7 +410,7 @@ class EnKFSensor:
 
         # Draw N independent observation noise samples in-place (no allocation).
         # self._eps ~ N(0, 1),  scaled by sqrt(R) to obtain N(0, R).
-        torch.randn_(self._eps)                         # (N,) ~ N(0, 1)
+        self._eps.normal_()                             # (N,) ~ N(0, 1)
         self._eps.mul_(self._sqrt_R)                    # (N,) ~ N(0, R)
 
         # Perturbed observations:  ỹ^i = y_obs + ε^i   ∈ ℝ^N

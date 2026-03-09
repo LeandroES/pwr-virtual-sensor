@@ -55,17 +55,19 @@ interface ChartRow {
 }
 
 function toChartRows(data: SensorResultPoint[]): ChartRow[] {
-  return data.map((p) => {
-    const twoSigma = 2 * p.inferred_t_fuel_std
-    return {
-      t:        p.sim_time_s,
-      tf_mean:  p.inferred_t_fuel_mean - 273.15,
-      tf_true:  p.true_t_fuel          - 273.15,
-      noisy_tc: p.noisy_t_coolant      - 273.15,
-      ci_upper: p.inferred_t_fuel_mean - 273.15 + twoSigma,
-      ci_lower: p.inferred_t_fuel_mean - 273.15 - twoSigma,
-    }
-  })
+  return data
+    .filter((p) => p.inferred_t_fuel_mean != null && isFinite(p.inferred_t_fuel_mean))
+    .map((p) => {
+      const twoSigma = 2 * (p.inferred_t_fuel_std ?? 0)
+      return {
+        t:        p.sim_time_s,
+        tf_mean:  p.inferred_t_fuel_mean - 273.15,
+        tf_true:  p.true_t_fuel          - 273.15,
+        noisy_tc: p.noisy_t_coolant      - 273.15,
+        ci_upper: p.inferred_t_fuel_mean - 273.15 + twoSigma,
+        ci_lower: p.inferred_t_fuel_mean - 273.15 - twoSigma,
+      }
+    })
 }
 
 // ── Custom tooltip ────────────────────────────────────────────────────────────
@@ -174,15 +176,17 @@ function EnKFLegend() {
 
 function fuelDomain(rows: ChartRow[]): [number, number] {
   if (rows.length === 0) return [600, 700]
-  const lows  = rows.flatMap((r) => [r.ci_lower, r.tf_true])
-  const highs = rows.flatMap((r) => [r.ci_upper, r.tf_true])
+  const lows  = rows.flatMap((r) => [r.ci_lower, r.tf_true]).filter(isFinite)
+  const highs = rows.flatMap((r) => [r.ci_upper, r.tf_true]).filter(isFinite)
+  if (lows.length === 0 || highs.length === 0) return [600, 700]
   const pad = 0.5
   return [Math.floor(Math.min(...lows) - pad), Math.ceil(Math.max(...highs) + pad)]
 }
 
 function coolDomain(rows: ChartRow[]): [number, number] {
   if (rows.length === 0) return [310, 340]
-  const vals = rows.map((r) => r.noisy_tc)
+  const vals = rows.map((r) => r.noisy_tc).filter(isFinite)
+  if (vals.length === 0) return [310, 340]
   const pad = 0.5
   return [Math.floor(Math.min(...vals) - pad), Math.ceil(Math.max(...vals) + pad)]
 }
@@ -223,7 +227,7 @@ export function VirtualSensorChart({ data, nominalFuelC, nominalCoolC }: Props) 
             type="number"
             domain={['dataMin', 'dataMax']}
             tick={{ fontSize: 10, fill: '#94a3b8', fontFamily: 'monospace' }}
-            tickFormatter={(v: number) => `${v.toFixed(1)}s`}
+            tickFormatter={(v: number) => isFinite(v) ? `${v.toFixed(1)}s` : ''}
             tickLine={{ stroke: '#475569' }}
             axisLine={{ stroke: '#475569' }}
             label={{
@@ -242,7 +246,7 @@ export function VirtualSensorChart({ data, nominalFuelC, nominalCoolC }: Props) 
             orientation="left"
             domain={fDomain}
             tick={{ fontSize: 10, fill: '#38bdf8', fontFamily: 'monospace' }}
-            tickFormatter={(v: number) => `${v.toFixed(1)}`}
+            tickFormatter={(v: number) => isFinite(v) ? `${v.toFixed(1)}` : ''}
             tickLine={{ stroke: '#475569' }}
             axisLine={{ stroke: '#475569' }}
             width={52}
@@ -263,7 +267,7 @@ export function VirtualSensorChart({ data, nominalFuelC, nominalCoolC }: Props) 
             orientation="right"
             domain={cDomain}
             tick={{ fontSize: 10, fill: '#fbbf24', fontFamily: 'monospace' }}
-            tickFormatter={(v: number) => `${v.toFixed(1)}`}
+            tickFormatter={(v: number) => isFinite(v) ? `${v.toFixed(1)}` : ''}
             tickLine={{ stroke: '#475569' }}
             axisLine={{ stroke: '#475569' }}
             width={56}

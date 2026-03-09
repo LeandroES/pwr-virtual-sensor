@@ -251,47 +251,52 @@ function SensorForm({ onSubmit, disabled }: FormProps) {
 
 // ── KPI strip ─────────────────────────────────────────────────────────────────
 
+const fmt = (v: number | null, decimals: number, fallback = '—') =>
+  v != null && isFinite(v) ? v.toFixed(decimals) : fallback
+
 function MetricsStrip({ m, obsSigma }: { m: SensorMetrics; obsSigma: number }) {
-  const rmseVsSigma = m.rmse_K / obsSigma
+  const rmseVsSigma = m.rmse_K != null && isFinite(m.rmse_K) ? m.rmse_K / obsSigma : null
 
   return (
     <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
 
       <MetricTile
         label="RMSE T_fuel"
-        value={`${m.rmse_K.toFixed(3)} K`}
-        sub={`${(rmseVsSigma * 100).toFixed(0)}% de σ_RTD = ${obsSigma.toFixed(1)} K`}
-        accent={m.rmse_K < 1 ? 'text-emerald-400' : m.rmse_K < 3 ? 'text-amber-400' : 'text-red-400'}
-        grade={m.rmse_K < 1 ? 'good' : m.rmse_K < 3 ? 'warn' : 'bad'}
+        value={`${fmt(m.rmse_K, 3)} K`}
+        sub={rmseVsSigma != null
+          ? `${(rmseVsSigma * 100).toFixed(0)}% de σ_RTD = ${obsSigma.toFixed(1)} K`
+          : `σ_RTD = ${obsSigma.toFixed(1)} K`}
+        accent={m.rmse_K == null ? 'text-slate-400' : m.rmse_K < 1 ? 'text-emerald-400' : m.rmse_K < 3 ? 'text-amber-400' : 'text-red-400'}
+        grade={m.rmse_K == null ? null : m.rmse_K < 1 ? 'good' : m.rmse_K < 3 ? 'warn' : 'bad'}
       />
 
       <MetricTile
         label="MAE T_fuel"
-        value={`${m.mae_K.toFixed(3)} K`}
+        value={`${fmt(m.mae_K, 3)} K`}
         sub="Error absoluto medio"
         accent="text-sky-300"
-        grade={m.mae_K < 0.8 ? 'good' : m.mae_K < 2.5 ? 'warn' : 'bad'}
+        grade={m.mae_K == null ? null : m.mae_K < 0.8 ? 'good' : m.mae_K < 2.5 ? 'warn' : 'bad'}
       />
 
       <MetricTile
         label="Cobertura 68%"
-        value={`${m.coverage_68pct.toFixed(1)} %`}
+        value={`${fmt(m.coverage_68pct, 1)} %`}
         sub="Esperado ≈ 68.3% (±1σ)"
-        accent={coverageGrade(m.coverage_68pct, 68.3) === 'good' ? 'text-emerald-400' : 'text-amber-400'}
-        grade={coverageGrade(m.coverage_68pct, 68.3)}
+        accent={m.coverage_68pct != null ? (coverageGrade(m.coverage_68pct, 68.3) === 'good' ? 'text-emerald-400' : 'text-amber-400') : 'text-slate-400'}
+        grade={m.coverage_68pct != null ? coverageGrade(m.coverage_68pct, 68.3) : null}
       />
 
       <MetricTile
         label="Cobertura 95%"
-        value={`${m.coverage_95pct.toFixed(1)} %`}
+        value={`${fmt(m.coverage_95pct, 1)} %`}
         sub="Esperado ≈ 95.4% (±2σ)"
-        accent={coverageGrade(m.coverage_95pct, 95.4) === 'good' ? 'text-emerald-400' : 'text-amber-400'}
-        grade={coverageGrade(m.coverage_95pct, 95.4)}
+        accent={m.coverage_95pct != null ? (coverageGrade(m.coverage_95pct, 95.4) === 'good' ? 'text-emerald-400' : 'text-amber-400') : 'text-slate-400'}
+        grade={m.coverage_95pct != null ? coverageGrade(m.coverage_95pct, 95.4) : null}
       />
 
       <MetricTile
         label="Incert. media σ"
-        value={`${m.mean_ensemble_std_K.toFixed(3)} K`}
+        value={`${fmt(m.mean_ensemble_std_K, 3)} K`}
         sub="Spread posterior promedio"
         accent="text-slate-300"
       />
@@ -494,20 +499,26 @@ export function VirtualSensorDashboard() {
               <span className="text-slate-400 font-semibold">CALIBRACIÓN:</span>
               <span>
                 Cob. 68%: {
-                  coverageGrade(metrics.coverage_68pct, 68.3) === 'good'
+                  metrics.coverage_68pct == null ? <span className="text-slate-500">—</span>
+                  : coverageGrade(metrics.coverage_68pct, 68.3) === 'good'
                     ? <span className="text-emerald-400">✓ CALIBRADO</span>
                     : <span className="text-amber-400">⚠ DESVIACIÓN {Math.abs(metrics.coverage_68pct - 68.3).toFixed(1)}%</span>
                 }
               </span>
               <span>
                 Cob. 95%: {
-                  coverageGrade(metrics.coverage_95pct, 95.4) === 'good'
+                  metrics.coverage_95pct == null ? <span className="text-slate-500">—</span>
+                  : coverageGrade(metrics.coverage_95pct, 95.4) === 'good'
                     ? <span className="text-emerald-400">✓ CALIBRADO</span>
                     : <span className="text-amber-400">⚠ DESVIACIÓN {Math.abs(metrics.coverage_95pct - 95.4).toFixed(1)}%</span>
                 }
               </span>
               <span className="ml-auto text-slate-600">
-                σ_RTD = {lastNoiseSigma.toFixed(1)} K · RMSE/σ = {(metrics.rmse_K / lastNoiseSigma * 100).toFixed(0)}%
+                σ_RTD = {lastNoiseSigma.toFixed(1)} K · RMSE/σ = {
+                  metrics.rmse_K != null && isFinite(metrics.rmse_K)
+                    ? `${(metrics.rmse_K / lastNoiseSigma * 100).toFixed(0)}%`
+                    : '—'
+                }
               </span>
             </div>
           </section>
