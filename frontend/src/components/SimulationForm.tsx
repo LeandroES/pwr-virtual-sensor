@@ -96,8 +96,25 @@ export function SimulationForm({ onSubmit, isLoading }: Props) {
         <span className="bg-gray-100 rounded px-2 py-1">
           Puntos estimados ≈ {Math.ceil(durationS / dtS) + 1}
         </span>
-        <span className="bg-gray-100 rounded px-2 py-1">
-          β ≈ 650 pcm → {Math.abs(reactivityPcm) < 650 ? 'Sub-prompt-crítico ✓' : 'Prompt-crítico ⚠'}
+        <span className={`rounded px-2 py-1 inline-flex items-center gap-1 ${
+          Math.abs(reactivityPcm) < 650 ? 'bg-gray-100' : 'bg-amber-50 text-amber-700'
+        }`}>
+          {Math.abs(reactivityPcm) < 650 ? (
+            <>
+              <svg className="w-3.5 h-3.5 text-green-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+              </svg>
+              Sub-prompt-crítico
+            </>
+          ) : (
+            <>
+              <svg className="w-3.5 h-3.5 text-amber-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                  d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+              </svg>
+              Prompt-crítico
+            </>
+          )}
         </span>
       </div>
 

@@ -33,6 +33,10 @@ export interface SensorJobStatus {
   time_span_start: number
   time_span_end: number
   dt: number
+  // Smart Switch execution telemetry (null until completed)
+  execution_time: number | null
+  device_used: string | null
+  device_reason: string | null
 }
 
 export interface SensorResultPoint {
@@ -63,6 +67,10 @@ export interface SensorResultsResponse {
   point_count: number
   truncated: boolean
   data: SensorResultPoint[]
+  // Smart Switch execution telemetry (null until completed)
+  execution_time: number | null
+  device_used: string | null
+  device_reason: string | null
 }
 
 // ── Request payloads ──────────────────────────────────────────────────────────
