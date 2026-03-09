@@ -18,6 +18,7 @@
  * HMI style: dark slate background, oscilloscope-style grid, monospaced numbers.
  */
 import { useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
 import {
   ComposedChart,
   Area,
@@ -72,26 +73,19 @@ function toChartRows(data: SensorResultPoint[]): ChartRow[] {
 
 // ── Custom tooltip ────────────────────────────────────────────────────────────
 
-interface TooltipRow {
-  name:  string
-  value: number
-  color: string
-  unit:  string
-}
-
 function EnKFTooltip({ active, payload, label }: TooltipProps<number, string>) {
+  const { t } = useTranslation()
   if (!active || !payload || payload.length === 0) return null
 
-  // Build a map from series name to the raw values we actually care about
   const byKey: Record<string, number> = {}
   payload.forEach((e) => { if (e.dataKey) byKey[e.dataKey as string] = e.value as number })
 
-  const rows: TooltipRow[] = [
-    { name: 'T_fuel inferida (EnKF)', value: byKey.tf_mean,  color: C_INFERRED, unit: '°C' },
-    { name: 'T_fuel real (verdad)',    value: byKey.tf_true,  color: C_TRUE,     unit: '°C' },
-    { name: 'RTD ruidoso (T_cool)',    value: byKey.noisy_tc, color: C_NOISE,    unit: '°C' },
-    { name: 'IC 95% superior',         value: byKey.ci_upper, color: '#93c5fd',  unit: '°C' },
-    { name: 'IC 95% inferior',         value: byKey.ci_lower, color: '#93c5fd',  unit: '°C' },
+  const rows = [
+    { name: t('chart.tfInferred'), value: byKey.tf_mean,  color: C_INFERRED, unit: '°C' },
+    { name: t('chart.tfTrue'),     value: byKey.tf_true,  color: C_TRUE,     unit: '°C' },
+    { name: t('chart.rtdNoisy'),   value: byKey.noisy_tc, color: C_NOISE,    unit: '°C' },
+    { name: t('chart.ciUpper'),    value: byKey.ci_upper, color: '#93c5fd',  unit: '°C' },
+    { name: t('chart.ciLower'),    value: byKey.ci_lower, color: '#93c5fd',  unit: '°C' },
   ].filter((r) => r.value !== undefined && !isNaN(r.value))
 
   const error = byKey.tf_mean !== undefined && byKey.tf_true !== undefined
@@ -117,7 +111,7 @@ function EnKFTooltip({ active, payload, label }: TooltipProps<number, string>) {
         ))}
         {error !== null && (
           <div className="flex items-center justify-between gap-5 border-t border-slate-700 pt-1 mt-1">
-            <span className="text-slate-400">Error instantáneo</span>
+            <span className="text-slate-400">{t('chart.instantError')}</span>
             <span
               className="font-mono tabular-nums font-semibold"
               style={{ color: Math.abs(error) < 1 ? '#4ade80' : '#f87171' }}
@@ -134,11 +128,13 @@ function EnKFTooltip({ active, payload, label }: TooltipProps<number, string>) {
 // ── Custom legend ─────────────────────────────────────────────────────────────
 
 function EnKFLegend() {
+  const { t } = useTranslation()
+
   const items = [
-    { label: 'T_fuel inferida (EnKF)',   color: C_INFERRED, lineStyle: 'solid',   shape: 'line' },
-    { label: 'IC ±2σ (95%)',             color: C_INFERRED, lineStyle: 'solid',   shape: 'area' },
-    { label: 'T_fuel real (ground truth)',color: C_TRUE,     lineStyle: 'dashed',  shape: 'line' },
-    { label: 'RTD ruidoso (T_cool)',      color: C_NOISE,    lineStyle: 'scatter', shape: 'dot'  },
+    { label: t('legendLabels.inferred'), color: C_INFERRED, lineStyle: 'solid',   shape: 'line' },
+    { label: t('legendLabels.ci'),       color: C_INFERRED, lineStyle: 'solid',   shape: 'area' },
+    { label: t('legendLabels.true'),     color: C_TRUE,     lineStyle: 'dashed',  shape: 'line' },
+    { label: t('legendLabels.rtd'),      color: C_NOISE,    lineStyle: 'scatter', shape: 'dot'  },
   ] as const
 
   return (
@@ -195,19 +191,17 @@ function coolDomain(rows: ChartRow[]): [number, number] {
 
 interface Props {
   data: SensorResultPoint[]
-  nominalFuelC: number     // nominal T_fuel [°C] for reference line
-  nominalCoolC: number     // nominal T_coolant [°C] for reference line
+  nominalFuelC: number
+  nominalCoolC: number
 }
 
 export function VirtualSensorChart({ data, nominalFuelC, nominalCoolC }: Props) {
-  const rows = useMemo(() => toChartRows(data), [data])
+  const { t } = useTranslation()
+  const rows    = useMemo(() => toChartRows(data), [data])
   const fDomain = useMemo(() => fuelDomain(rows), [rows])
   const cDomain = useMemo(() => coolDomain(rows), [rows])
 
   return (
-    // The wrapper div's background MUST match CHART_BG so the CI mask trick works:
-    // Area[ci_lower] is filled with CHART_BG, masking the bottom half of
-    // Area[ci_upper], creating the visual appearance of a band from −2σ to +2σ.
     <div className="rounded-xl overflow-hidden" style={{ background: CHART_BG }}>
       <ResponsiveContainer width="100%" height={420}>
         <ComposedChart
@@ -231,7 +225,7 @@ export function VirtualSensorChart({ data, nominalFuelC, nominalCoolC }: Props) 
             tickLine={{ stroke: '#475569' }}
             axisLine={{ stroke: '#475569' }}
             label={{
-              value: 'Tiempo [s]',
+              value: t('chart.timeAxis'),
               position: 'insideBottom',
               offset: -14,
               fontSize: 10,
@@ -251,7 +245,7 @@ export function VirtualSensorChart({ data, nominalFuelC, nominalCoolC }: Props) 
             axisLine={{ stroke: '#475569' }}
             width={52}
             label={{
-              value: 'T_fuel [°C]',
+              value: t('chart.fuelAxis'),
               angle: -90,
               position: 'insideLeft',
               offset: 6,
@@ -272,7 +266,7 @@ export function VirtualSensorChart({ data, nominalFuelC, nominalCoolC }: Props) 
             axisLine={{ stroke: '#475569' }}
             width={56}
             label={{
-              value: 'T_cool RTD [°C]',
+              value: t('chart.coolAxis'),
               angle: 90,
               position: 'insideRight',
               offset: 6,
@@ -307,23 +301,7 @@ export function VirtualSensorChart({ data, nominalFuelC, nominalCoolC }: Props) 
             strokeDasharray="8 4"
           />
 
-          {/* ── CI BAND (95% confidence interval ±2σ around T_fuel estimate) ─
-           *
-           *  Technique: "background mask areas"
-           *
-           *  Layer 1 — Area ci_upper (yAxisId="fuel"):
-           *    Fills from domain floor (fDomain[0]) UP TO (mean + 2σ) with
-           *    a semi-transparent sky-blue.  This covers the FULL CI band AND
-           *    the thin strip below it down to the axis floor.
-           *
-           *  Layer 2 — Area ci_lower (yAxisId="fuel"):
-           *    Fills from domain floor UP TO (mean − 2σ) with the SAME colour
-           *    as the chart background (CHART_BG).  This masks (hides) the
-           *    lower portion of Layer 1, revealing only the CI band.
-           *
-           *  Result: visible blue band from (mean−2σ) to (mean+2σ), zero
-           *  stacking artifacts, works at any Y-axis domain.
-           * ─────────────────────────────────────────────────────────────── */}
+          {/* ── CI BAND (95% confidence interval ±2σ) ────────────────────── */}
           <Area
             yAxisId="fuel"
             type="monotone"
@@ -347,7 +325,7 @@ export function VirtualSensorChart({ data, nominalFuelC, nominalCoolC }: Props) 
             isAnimationActive={false}
           />
 
-          {/* ── Ground truth T_fuel (dashed red) — drawn BEHIND EnKF line ── */}
+          {/* ── Ground truth T_fuel (dashed red) ────────────────────────── */}
           <Line
             yAxisId="fuel"
             type="monotone"
@@ -361,7 +339,7 @@ export function VirtualSensorChart({ data, nominalFuelC, nominalCoolC }: Props) 
             isAnimationActive={false}
           />
 
-          {/* ── EnKF posterior mean T_fuel (solid cyan) ────────────────────── */}
+          {/* ── EnKF posterior mean T_fuel (solid cyan) ─────────────────── */}
           <Line
             yAxisId="fuel"
             type="monotone"
@@ -374,7 +352,7 @@ export function VirtualSensorChart({ data, nominalFuelC, nominalCoolC }: Props) 
             isAnimationActive={false}
           />
 
-          {/* ── Noisy RTD coolant readings (amber scatter dots, no line) ───── */}
+          {/* ── Noisy RTD coolant readings (amber scatter dots) ──────────── */}
           <Line
             yAxisId="cool"
             type="monotone"

@@ -13,12 +13,15 @@
  *   idle -> submitting -> polling (status) -> fetching results -> displaying
  */
 import { useState, useCallback, useMemo, useRef } from 'react'
+import { useTranslation } from 'react-i18next'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import html2canvas from 'html2canvas'
 import jsPDF from 'jspdf'
 import { VirtualSensorChart } from '../components/VirtualSensorChart'
 import { submitSensorJob, getSensorStatus, getSensorResults } from '../api/sensor'
 import type { SensorSimulateRequest, SensorMetrics, SensorResultsResponse, RunStatus } from '../types'
+import { LANGUAGES, type LangCode } from '../i18n'
+import i18n from '../i18n'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -104,6 +107,47 @@ function IconGpu({ className = 'w-4 h-4' }: { className?: string }) {
   )
 }
 
+function IconGlobe({ className = 'w-4 h-4' }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+      <circle cx="12" cy="12" r="10" strokeWidth="1.5" />
+      <path strokeWidth="1.5" strokeLinecap="round"
+        d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10A15.3 15.3 0 0112 2z" />
+    </svg>
+  )
+}
+
+// ── Language selector ─────────────────────────────────────────────────────────
+
+function LanguageSelector() {
+  const [current, setCurrent] = useState<LangCode>(i18n.language as LangCode)
+
+  const handleChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const lang = e.target.value as LangCode
+    i18n.changeLanguage(lang)
+    setCurrent(lang)
+  }
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <IconGlobe className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+      <select
+        value={current}
+        onChange={handleChange}
+        className="bg-slate-900 border border-slate-700 rounded-md px-2 py-1
+          text-[10px] font-mono text-slate-400 focus:outline-none focus:ring-1
+          focus:ring-cyan-500 focus:border-cyan-500 transition cursor-pointer
+          hover:border-slate-600 hover:text-slate-300"
+        aria-label="Select language"
+      >
+        {LANGUAGES.map((l) => (
+          <option key={l.code} value={l.code}>{l.label}</option>
+        ))}
+      </select>
+    </div>
+  )
+}
+
 // ── LED status indicator ───────────────────────────────────────────────────────
 
 function Led({ status }: { status: RunStatus | 'idle' }) {
@@ -162,6 +206,7 @@ interface FormProps {
 }
 
 function SensorForm({ onSubmit, disabled }: FormProps) {
+  const { t } = useTranslation()
   const [state, setState] = useState<FormState>(FORM_DEFAULTS)
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -182,7 +227,7 @@ function SensorForm({ onSubmit, disabled }: FormProps) {
     return (
       <label className="flex flex-col gap-1.5">
         <span className="text-[10px] font-semibold tracking-widest text-slate-500 uppercase">
-          {label} <span className="text-slate-600 normal-case font-mono">[{unit}]</span>
+          {label}{unit && <span className="text-slate-600 normal-case font-mono"> [{unit}]</span>}
         </span>
         {children}
       </label>
@@ -197,7 +242,7 @@ function SensorForm({ onSubmit, disabled }: FormProps) {
     <form onSubmit={handleSubmit} className="space-y-5">
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
 
-        {field('Reactividad', 'pcm',
+        {field(t('form.reactivity'), 'pcm',
           <input type="number" className={inputCls}
             value={state.external_reactivity_pcm} min={-1000} max={1000} step={1}
             disabled={disabled}
@@ -205,7 +250,7 @@ function SensorForm({ onSubmit, disabled }: FormProps) {
           />
         )}
 
-        {field('Duración', 's',
+        {field(t('form.duration'), 's',
           <input type="number" className={inputCls}
             value={state.time_span_end} min={5} max={3600} step={5}
             disabled={disabled}
@@ -213,7 +258,7 @@ function SensorForm({ onSubmit, disabled }: FormProps) {
           />
         )}
 
-        {field('Paso dt', 'ms',
+        {field(t('form.stepDt'), 'ms',
           <select className={inputCls} value={state.dt_ms} disabled={disabled}
             onChange={(e) => setState((s) => ({ ...s, dt_ms: e.target.value }))}
           >
@@ -223,7 +268,7 @@ function SensorForm({ onSubmit, disabled }: FormProps) {
           </select>
         )}
 
-        {field('Ensemble N', 'miembros',
+        {field(t('form.ensembleN'), t('form.members'),
           <select className={inputCls} value={state.ensemble_size} disabled={disabled}
             onChange={(e) => setState((s) => ({ ...s, ensemble_size: +e.target.value }))}
           >
@@ -235,7 +280,7 @@ function SensorForm({ onSubmit, disabled }: FormProps) {
           </select>
         )}
 
-        {field('Ruido σ_RTD', 'K',
+        {field(t('form.noiseSigma'), 'K',
           <input type="number" className={inputCls}
             value={state.obs_noise_std_K} min={0.1} max={50} step={0.5}
             disabled={disabled}
@@ -243,24 +288,24 @@ function SensorForm({ onSubmit, disabled }: FormProps) {
           />
         )}
 
-        {field('Dispositivo', '',
+        {field(t('form.device'), '',
           <select className={inputCls} value={state.device} disabled={disabled}
             onChange={(e) => setState((s) => ({ ...s, device: e.target.value as 'cuda' | 'cpu' }))}
           >
-            <option value="cuda">CUDA / ROCm</option>
-            <option value="cpu">CPU (debug)</option>
+            <option value="cuda">{t('form.deviceCuda')}</option>
+            <option value="cpu">{t('form.deviceCpu')}</option>
           </select>
         )}
       </div>
 
       <div className="flex items-center gap-3 bg-slate-800/60 border border-slate-700 rounded-lg px-4 py-2.5 text-xs font-mono text-slate-400">
-        <span className="shrink-0 text-amber-400 font-semibold">RUIDO</span>
+        <span className="shrink-0 text-amber-400 font-semibold">{t('form.noiseLabel')}</span>
         <span>σ_RTD = {state.obs_noise_std_K.toFixed(1)} K</span>
         <span className="text-slate-600">→</span>
         <span>R = σ² = {(state.obs_noise_std_K ** 2).toFixed(2)} K²</span>
         <span className="text-slate-600 ml-auto">
-          ~{Math.round(state.time_span_end / (parseFloat(state.dt_ms) / 1000)).toLocaleString()} pasos
-          · N = {state.ensemble_size.toLocaleString()} miembros
+          ~{Math.round(state.time_span_end / (parseFloat(state.dt_ms) / 1000)).toLocaleString()} {t('form.steps')}
+          · N = {state.ensemble_size.toLocaleString()} {t('form.members')}
         </span>
       </div>
 
@@ -277,12 +322,12 @@ function SensorForm({ onSubmit, disabled }: FormProps) {
           {disabled ? (
             <>
               <span className="w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin" />
-              Procesando…
+              {t('form.processing')}
             </>
           ) : (
             <>
               <IconBolt />
-              Iniciar análisis EnKF
+              {t('form.submit')}
             </>
           )}
         </button>
@@ -297,44 +342,45 @@ const fmt = (v: number | null, decimals: number, fallback = '—') =>
   v != null && isFinite(v) ? v.toFixed(decimals) : fallback
 
 function MetricsStrip({ m, obsSigma }: { m: SensorMetrics; obsSigma: number }) {
+  const { t } = useTranslation()
   const rmseVsSigma = m.rmse_K != null && isFinite(m.rmse_K) ? m.rmse_K / obsSigma : null
 
   return (
     <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
       <MetricTile
-        label="RMSE T_fuel"
+        label={t('metrics.rmse')}
         value={`${fmt(m.rmse_K, 3)} K`}
         sub={rmseVsSigma != null
-          ? `${(rmseVsSigma * 100).toFixed(0)}% de σ_RTD = ${obsSigma.toFixed(1)} K`
+          ? t('metrics.ofSigmaRtd', { pct: (rmseVsSigma * 100).toFixed(0), sigma: obsSigma.toFixed(1) })
           : `σ_RTD = ${obsSigma.toFixed(1)} K`}
         accent={m.rmse_K == null ? 'text-slate-400' : m.rmse_K < 1 ? 'text-emerald-400' : m.rmse_K < 3 ? 'text-amber-400' : 'text-red-400'}
         grade={m.rmse_K == null ? null : m.rmse_K < 1 ? 'good' : m.rmse_K < 3 ? 'warn' : 'bad'}
       />
       <MetricTile
-        label="MAE T_fuel"
+        label={t('metrics.mae')}
         value={`${fmt(m.mae_K, 3)} K`}
-        sub="Error absoluto medio"
+        sub={t('metrics.meanAbsError')}
         accent="text-sky-300"
         grade={m.mae_K == null ? null : m.mae_K < 0.8 ? 'good' : m.mae_K < 2.5 ? 'warn' : 'bad'}
       />
       <MetricTile
-        label="Cobertura 68%"
+        label={t('metrics.cov68')}
         value={`${fmt(m.coverage_68pct, 1)} %`}
-        sub="Esperado: 68.3% (±1σ)"
+        sub={t('metrics.expected68')}
         accent={m.coverage_68pct != null ? (coverageGrade(m.coverage_68pct, 68.3) === 'good' ? 'text-emerald-400' : 'text-amber-400') : 'text-slate-400'}
         grade={m.coverage_68pct != null ? coverageGrade(m.coverage_68pct, 68.3) : null}
       />
       <MetricTile
-        label="Cobertura 95%"
+        label={t('metrics.cov95')}
         value={`${fmt(m.coverage_95pct, 1)} %`}
-        sub="Esperado: 95.4% (±2σ)"
+        sub={t('metrics.expected95')}
         accent={m.coverage_95pct != null ? (coverageGrade(m.coverage_95pct, 95.4) === 'good' ? 'text-emerald-400' : 'text-amber-400') : 'text-slate-400'}
         grade={m.coverage_95pct != null ? coverageGrade(m.coverage_95pct, 95.4) : null}
       />
       <MetricTile
-        label="Incert. media σ"
+        label={t('metrics.meanStd')}
         value={`${fmt(m.mean_ensemble_std_K, 3)} K`}
-        sub="Spread posterior promedio"
+        sub={t('metrics.posteriorSpread')}
         accent="text-slate-300"
       />
     </div>
@@ -350,6 +396,7 @@ interface ExecutionPanelProps {
 }
 
 function ExecutionPanel({ executionTime, deviceUsed, deviceReason }: ExecutionPanelProps) {
+  const { t } = useTranslation()
   if (!deviceUsed) return null
 
   const isGpu = deviceUsed.toLowerCase() === 'cuda'
@@ -359,24 +406,22 @@ function ExecutionPanel({ executionTime, deviceUsed, deviceReason }: ExecutionPa
       <div className="flex items-center gap-2 mb-3">
         <div className="w-1 h-4 rounded-full bg-violet-500" />
         <h2 className="text-[10px] font-bold tracking-widest text-slate-500 uppercase font-mono">
-          Motor de Cómputo — Smart Switch
+          {t('sections.computeEngine')}
         </h2>
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
 
-        {/* Execution time */}
         <MetricTile
-          label="Tiempo de Ejecución"
+          label={t('execution.execTime')}
           value={executionTime != null ? `${executionTime.toFixed(2)} s` : '—'}
-          sub="EnKF: inicialización + loop + flush I/O"
+          sub={t('execution.execSub')}
           accent="text-violet-300"
         />
 
-        {/* Device selected */}
         <div className="bg-slate-900 border border-slate-700 rounded-xl p-4 flex flex-col gap-2">
           <p className="text-[10px] font-semibold tracking-widest text-slate-500 uppercase">
-            Motor Seleccionado
+            {t('execution.selectedEngine')}
           </p>
           <div className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-md w-fit
             font-mono font-bold text-sm
@@ -386,19 +431,16 @@ function ExecutionPanel({ executionTime, deviceUsed, deviceReason }: ExecutionPa
             }`}
           >
             {isGpu ? <IconGpu /> : <IconCpu />}
-            {isGpu ? 'GPU / CUDA' : 'CPU'}
+            {isGpu ? t('execution.gpu') : t('execution.cpu')}
           </div>
           <p className="text-[10px] text-slate-600 font-mono mt-1">
-            {isGpu
-              ? 'Aceleración ROCm / HIP activa'
-              : 'Modo vectorizado multi-hilo (AVX2)'}
+            {isGpu ? t('execution.gpuDesc') : t('execution.cpuDesc')}
           </p>
         </div>
 
-        {/* Reason */}
         <div className="bg-slate-900 border border-slate-700 rounded-xl p-4 flex flex-col gap-2">
           <p className="text-[10px] font-semibold tracking-widest text-slate-500 uppercase">
-            Razón de Selección
+            {t('execution.selectionReason')}
           </p>
           <p className="text-xs text-slate-300 font-mono leading-relaxed">
             {deviceReason ?? '—'}
@@ -412,6 +454,7 @@ function ExecutionPanel({ executionTime, deviceUsed, deviceReason }: ExecutionPa
 // ── Running banner ────────────────────────────────────────────────────────────
 
 function RunningBanner({ jobId }: { jobId: string }) {
+  const { t } = useTranslation()
   return (
     <div className="bg-slate-900 border border-cyan-800/50 rounded-xl p-4 flex items-center gap-4">
       <div className="relative shrink-0">
@@ -421,12 +464,14 @@ function RunningBanner({ jobId }: { jobId: string }) {
         </div>
       </div>
       <div className="flex-1 min-w-0">
-        <p className="text-sm font-semibold text-cyan-300">EnKF en ejecución</p>
+        <p className="text-sm font-semibold text-cyan-300">{t('running.title')}</p>
         <p className="text-xs text-slate-500 font-mono truncate">{jobId}</p>
       </div>
       <div className="text-right shrink-0">
-        <p className="text-xs text-slate-400">ScipySolver → Ensemble → TimescaleDB</p>
-        <p className="text-[10px] text-slate-600 font-mono mt-0.5">sondeo cada {POLL_MS / 1000} s</p>
+        <p className="text-xs text-slate-400">{t('running.subtitle')}</p>
+        <p className="text-[10px] text-slate-600 font-mono mt-0.5">
+          {t('running.polling', { sec: POLL_MS / 1000 })}
+        </p>
       </div>
     </div>
   )
@@ -435,11 +480,12 @@ function RunningBanner({ jobId }: { jobId: string }) {
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export function VirtualSensorDashboard() {
-  const [activeJobId, setActiveJobId]     = useState<string | null>(null)
+  const { t } = useTranslation()
+  const [activeJobId, setActiveJobId]       = useState<string | null>(null)
   const [lastNoiseSigma, setLastNoiseSigma] = useState(FORM_DEFAULTS.obs_noise_std_K)
-  const [isExporting, setIsExporting]     = useState(false)
-  const exportRef                         = useRef<HTMLDivElement>(null)
-  const queryClient                       = useQueryClient()
+  const [isExporting, setIsExporting]       = useState(false)
+  const exportRef                           = useRef<HTMLDivElement>(null)
+  const queryClient                         = useQueryClient()
 
   // ── POST /sensor/simulate ───────────────────────────────────────────────
   const submitMutation = useMutation({
@@ -482,7 +528,6 @@ export function VirtualSensorDashboard() {
   const metrics   = resultsData?.metrics ?? null
   const chartData = useMemo(() => resultsData?.data ?? [], [resultsData])
 
-  // Smart Switch telemetry — prefer results endpoint, fall back to status
   const executionTime = resultsData?.execution_time ?? statusData?.execution_time ?? null
   const deviceUsed    = resultsData?.device_used    ?? statusData?.device_used    ?? null
   const deviceReason  = resultsData?.device_reason  ?? statusData?.device_reason  ?? null
@@ -504,14 +549,12 @@ export function VirtualSensorDashboard() {
     try {
       const canvas = await html2canvas(exportRef.current, {
         scale: 2,
-        backgroundColor: '#020617',   // slate-950
+        backgroundColor: '#020617',
         useCORS: true,
         logging: false,
       })
 
       const imgData = canvas.toDataURL('image/png')
-
-      // A4 portrait in mm
       const A4_W = 210
       const A4_H = 297
 
@@ -520,14 +563,12 @@ export function VirtualSensorDashboard() {
       const imgW = A4_W
       const imgH = (canvas.height / canvas.width) * A4_W
 
-      // Render page by page if the content exceeds one A4 sheet
       let pageTop = 0
       let remaining = imgH
       let page = 0
 
       while (remaining > 0) {
         if (page > 0) pdf.addPage()
-        // Shift image upward so the correct slice appears on this page
         pdf.addImage(imgData, 'PNG', 0, -pageTop, imgW, imgH)
         pageTop  += A4_H
         remaining -= A4_H
@@ -542,6 +583,13 @@ export function VirtualSensorDashboard() {
 
   const ledStatus: RunStatus | 'idle' = currentStatus ?? 'idle'
   const hasResults = currentStatus === 'completed' && (metrics !== null || chartData.length > 0)
+
+  const statusLabel: Record<string, string> = {
+    pending:   t('status.pending'),
+    running:   t('status.running'),
+    completed: t('status.completed'),
+    failed:    t('status.failed'),
+  }
 
   return (
     <div className="min-h-screen flex flex-col" style={{ background: '#020617' }}>
@@ -565,18 +613,18 @@ export function VirtualSensorDashboard() {
             <div className="flex items-center gap-2">
               <Led status={ledStatus} />
               <h1 className="text-sm font-bold tracking-wider text-slate-100 uppercase font-mono">
-                Virtual Sensor · EnKF
+                {t('header.title')}
               </h1>
               <span className="hidden sm:inline text-[10px] text-slate-600 font-mono border border-slate-800 rounded px-1.5 py-0.5">
-                Asimilación de Datos
+                {t('header.tagline')}
               </span>
             </div>
             <p className="text-[10px] text-slate-600 font-mono mt-0.5 pl-4">
-              Ensemble Kalman Filter · RK4 Vectorizado · ROCm/CUDA · TimescaleDB
+              {t('header.subtitle')}
             </p>
           </div>
 
-          {/* Status badge + Export PDF button */}
+          {/* Right side: status + language selector + PDF export + API dot */}
           <div className="ml-auto flex items-center gap-3">
             {currentStatus && (
               <span className={`text-xs font-mono font-semibold px-2.5 py-1 rounded border
@@ -585,11 +633,10 @@ export function VirtualSensorDashboard() {
                 : currentStatus === 'pending'   ? 'text-amber-400 border-amber-700/50 bg-amber-950/50'
                 : 'text-red-400 border-red-700/50 bg-red-950/50'
               }`}>
-                {currentStatus.toUpperCase()}
+                {statusLabel[currentStatus] ?? currentStatus.toUpperCase()}
               </span>
             )}
 
-            {/* PDF export — visible only when there are results to capture */}
             {hasResults && (
               <button
                 onClick={handleExportPdf}
@@ -599,25 +646,27 @@ export function VirtualSensorDashboard() {
                   text-xs font-semibold text-slate-300 tracking-wide font-mono
                   transition focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-offset-2 focus:ring-offset-slate-950
                   disabled:opacity-50 disabled:cursor-not-allowed"
-                title={`Exportar análisis del job ${activeJobId}`}
+                title={`Export job ${activeJobId}`}
               >
                 {isExporting ? (
                   <>
                     <span className="w-3.5 h-3.5 rounded-full border border-slate-400/30 border-t-slate-300 animate-spin" />
-                    Generando…
+                    {t('header.generating')}
                   </>
                 ) : (
                   <>
                     <IconDownload />
-                    Exportar Informe PDF
+                    {t('header.exportPdf')}
                   </>
                 )}
               </button>
             )}
 
+            <LanguageSelector />
+
             <div className="hidden sm:flex items-center gap-1.5 text-[10px] text-slate-600 font-mono">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block" aria-hidden />
-              API
+              {t('header.api')}
             </div>
           </div>
         </div>
@@ -632,7 +681,7 @@ export function VirtualSensorDashboard() {
             <div className="flex items-center gap-2 mb-5">
               <div className="w-1 h-4 rounded-full bg-cyan-500" />
               <h2 className="text-[10px] font-bold tracking-widest text-slate-400 uppercase font-mono">
-                Parámetros del Filtro EnKF
+                {t('sections.filterParams')}
               </h2>
             </div>
             <SensorForm onSubmit={handleSubmit} disabled={isRunning} />
@@ -644,10 +693,10 @@ export function VirtualSensorDashboard() {
                     d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
                 <span>
-                  <strong className="text-red-400">ERROR:</strong>{' '}
+                  <strong className="text-red-400">{t('error.error')}</strong>{' '}
                   {submitMutation.error instanceof Error
                     ? submitMutation.error.message
-                    : 'Error de red desconocido'}
+                    : t('error.networkError')}
                 </span>
               </div>
             )}
@@ -659,7 +708,7 @@ export function VirtualSensorDashboard() {
           {/* ── Worker error ───────────────────────────────────────────── */}
           {statusData?.error_message && (
             <div className="bg-red-950/60 border border-red-800/50 rounded-xl p-4 text-sm text-red-300 font-mono">
-              <span className="text-red-500 font-bold">WORKER ERROR: </span>
+              <span className="text-red-500 font-bold">{t('error.workerError')} </span>
               {statusData.error_message}
             </div>
           )}
@@ -679,10 +728,10 @@ export function VirtualSensorDashboard() {
               <div className="flex items-center gap-2 mb-3">
                 <div className="w-1 h-4 rounded-full bg-emerald-500" />
                 <h2 className="text-[10px] font-bold tracking-widest text-slate-500 uppercase font-mono">
-                  Métricas de Rendimiento del Filtro
+                  {t('sections.filterMetrics')}
                 </h2>
                 <span className="ml-auto text-[10px] text-slate-600 font-mono">
-                  {metrics.total_points.toLocaleString()} puntos totales
+                  {t('metrics.totalPoints', { n: metrics.total_points.toLocaleString() })}
                 </span>
               </div>
               <MetricsStrip m={metrics} obsSigma={lastNoiseSigma} />
@@ -690,34 +739,34 @@ export function VirtualSensorDashboard() {
               {/* Calibration indicator */}
               <div className="mt-3 bg-slate-900 border border-slate-800 rounded-lg px-4 py-2.5
                 flex flex-wrap items-center gap-x-6 gap-y-1 text-[10px] font-mono text-slate-500">
-                <span className="text-slate-400 font-semibold">CALIBRACIÓN:</span>
+                <span className="text-slate-400 font-semibold">{t('calibration.title')}</span>
 
                 <span className="flex items-center gap-1">
-                  Cob. 68%:{' '}
+                  {t('calibration.cov68')}{' '}
                   {metrics.coverage_68pct == null
                     ? <span className="text-slate-500">—</span>
                     : coverageGrade(metrics.coverage_68pct, 68.3) === 'good'
                       ? <span className="inline-flex items-center gap-1 text-emerald-400">
-                          <IconCheck className="w-3 h-3" /> CALIBRADO
+                          <IconCheck className="w-3 h-3" /> {t('calibration.calibrated')}
                         </span>
                       : <span className="inline-flex items-center gap-1 text-amber-400">
                           <IconWarning className="w-3 h-3" />
-                          DESV. {Math.abs(metrics.coverage_68pct - 68.3).toFixed(1)}%
+                          {t('calibration.deviation')} {Math.abs(metrics.coverage_68pct - 68.3).toFixed(1)}%
                         </span>
                   }
                 </span>
 
                 <span className="flex items-center gap-1">
-                  Cob. 95%:{' '}
+                  {t('calibration.cov95')}{' '}
                   {metrics.coverage_95pct == null
                     ? <span className="text-slate-500">—</span>
                     : coverageGrade(metrics.coverage_95pct, 95.4) === 'good'
                       ? <span className="inline-flex items-center gap-1 text-emerald-400">
-                          <IconCheck className="w-3 h-3" /> CALIBRADO
+                          <IconCheck className="w-3 h-3" /> {t('calibration.calibrated')}
                         </span>
                       : <span className="inline-flex items-center gap-1 text-amber-400">
                           <IconWarning className="w-3 h-3" />
-                          DESV. {Math.abs(metrics.coverage_95pct - 95.4).toFixed(1)}%
+                          {t('calibration.deviation')} {Math.abs(metrics.coverage_95pct - 95.4).toFixed(1)}%
                         </span>
                   }
                 </span>
@@ -739,12 +788,15 @@ export function VirtualSensorDashboard() {
               <div className="flex items-center gap-2 mb-3">
                 <div className="w-1 h-4 rounded-full bg-sky-400" />
                 <h2 className="text-[10px] font-bold tracking-widest text-slate-500 uppercase font-mono">
-                  Respuesta Transitoria — T_fuel Inferida vs Verdad Real
+                  {t('sections.transientResponse')}
                 </h2>
                 {resultsData?.truncated && (
                   <span className="ml-auto inline-flex items-center gap-1 text-[10px] text-amber-500/70 font-mono">
                     <IconWarning className="w-3 h-3" />
-                    Vista reducida · {resultsData.point_count.toLocaleString()} / {resultsData.total_point_count.toLocaleString()} puntos
+                    {t('chart.truncated', {
+                      n:     resultsData.point_count.toLocaleString(),
+                      total: resultsData.total_point_count.toLocaleString(),
+                    })}
                   </span>
                 )}
               </div>
@@ -760,19 +812,31 @@ export function VirtualSensorDashboard() {
                 grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-2 text-[10px] font-mono text-slate-500">
                 <div className="flex items-center gap-2">
                   <svg width="24" height="8" aria-hidden><line x1="0" y1="4" x2="24" y2="4" stroke="#38bdf8" strokeWidth="2.5" /></svg>
-                  <span><span className="text-cyan-300">T_fuel inferida</span> — Media posterior del EnKF. Estimación de la T real del combustible.</span>
+                  <span>
+                    <span className="text-cyan-300">{t('legendLabels.inferred')}</span>
+                    {' — '}{t('legend.inferredDesc')}
+                  </span>
                 </div>
                 <div className="flex items-center gap-2">
                   <svg width="24" height="8" aria-hidden><line x1="0" y1="4" x2="24" y2="4" stroke="#f87171" strokeWidth="1.5" strokeDasharray="5 3" /></svg>
-                  <span><span className="text-red-400">T_fuel real</span> — Verdad oculta (ScipySolver Radau). No disponible en producción.</span>
+                  <span>
+                    <span className="text-red-400">{t('legendLabels.true')}</span>
+                    {' — '}{t('legend.trueDesc')}
+                  </span>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="inline-block w-6 h-3 rounded-sm" style={{ background: 'rgba(56,189,248,0.14)', border: '1px solid #38bdf8' }} aria-hidden />
-                  <span><span className="text-sky-300">IC ±2σ (95%)</span> — Intervalo de confianza posterior. Calibrado: ~95% de la verdad debe estar dentro.</span>
+                  <span>
+                    <span className="text-sky-300">{t('legendLabels.ci')}</span>
+                    {' — '}{t('legend.ciDesc')}
+                  </span>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="inline-block w-2.5 h-2.5 rounded-full bg-amber-400" aria-hidden />
-                  <span><span className="text-amber-400">RTD ruidoso</span> — T_coolant + ruido Gaussiano σ={lastNoiseSigma.toFixed(1)} K. Única observación del filtro.</span>
+                  <span>
+                    <span className="text-amber-400">{t('legendLabels.rtd')}</span>
+                    {' — '}{t('legend.rtdDesc', { sigma: lastNoiseSigma.toFixed(1) })}
+                  </span>
                 </div>
               </div>
             </section>
@@ -787,7 +851,7 @@ export function VirtualSensorDashboard() {
                   <div className="w-3 h-3 rounded-full bg-cyan-600 animate-pulse" />
                 </div>
               </div>
-              <p className="text-xs text-slate-500 font-mono">Descargando resultados EnKF…</p>
+              <p className="text-xs text-slate-500 font-mono">{t('loading.results')}</p>
             </div>
           )}
 
@@ -815,12 +879,10 @@ export function VirtualSensorDashboard() {
               </div>
               <div>
                 <p className="text-slate-400 font-semibold font-mono text-sm">
-                  SENSOR VIRTUAL INACTIVO
+                  {t('empty.title')}
                 </p>
                 <p className="text-slate-600 text-xs font-mono mt-2 max-w-md">
-                  Configura los parámetros del filtro EnKF y lanza el análisis para ver cómo el
-                  ensemble de N reactores virtuales infiere la temperatura del combustible a partir
-                  de la señal ruidosa del RTD de refrigerante.
+                  {t('empty.desc')}
                 </p>
               </div>
               <div className="grid grid-cols-3 gap-6 text-[10px] text-slate-600 font-mono max-w-sm">
@@ -832,8 +894,8 @@ export function VirtualSensorDashboard() {
                           d="M13 10V3L4 14h7v7l9-11h-7z" />
                       </svg>
                     ),
-                    title: 'RK4 vectorizado',
-                    sub: 'Sin bucles sobre N',
+                    title: t('empty.rk4Title'),
+                    sub:   t('empty.rk4Sub'),
                   },
                   {
                     icon: (
@@ -844,8 +906,8 @@ export function VirtualSensorDashboard() {
                         <path d="M12 2v4M12 18v4M2 12h4M18 12h4" strokeWidth="1.5" strokeLinecap="round" />
                       </svg>
                     ),
-                    title: 'EnKF estocástico',
-                    sub: 'P_f via torch.cov',
+                    title: t('empty.enkfTitle'),
+                    sub:   t('empty.enkfSub'),
                   },
                   {
                     icon: (
@@ -854,8 +916,8 @@ export function VirtualSensorDashboard() {
                         <path strokeWidth="1.5" d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
                       </svg>
                     ),
-                    title: 'TimescaleDB',
-                    sub: 'Batch execute_values',
+                    title: t('empty.dbTitle'),
+                    sub:   t('empty.dbSub'),
                   },
                 ] as const).map(({ icon, title, sub }) => (
                   <div key={title} className="text-center space-y-2">
@@ -874,8 +936,8 @@ export function VirtualSensorDashboard() {
       <footer className="border-t border-slate-900">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-2.5
           flex flex-wrap justify-between gap-2 text-[10px] font-mono text-slate-700">
-          <span>PWR Virtual Sensor · Ensemble Kalman Filter · Asimilación de Datos</span>
-          <span>PyTorch (ROCm) · ScipySolver Radau · TimescaleDB Hypertable</span>
+          <span>{t('footer.left')}</span>
+          <span>{t('footer.right')}</span>
         </div>
       </footer>
     </div>
