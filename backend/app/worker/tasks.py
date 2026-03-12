@@ -306,7 +306,7 @@ def run_virtual_sensor_job(
     # Placing the import here means the module still loads on workers without
     # a GPU; the error surfaces at task execution time with a clear message.
     try:
-        from app.physics.assimilation import EnKFConfig, EnKFSensor
+        from app.physics.assimilation import EnKFConfig, EnKFSensor, calculate_diagnostics
         from app.physics.tensor_solver import EnsembleSolver, NoiseConfig
     except RuntimeError as exc:
         raise RuntimeError(
@@ -442,6 +442,7 @@ def run_virtual_sensor_job(
         row_buffer: list[tuple[object, ...]] = []
         run_uuid   = uuid.UUID(run_id)
         sq_errors: list[float] = []      # for RMSE computation
+        spreads:   list[float] = []      # for Spread-Skill ratio
         rows_inserted = 0
 
         # ── t=0: record the prior (initial ensemble) without stepping ────────
@@ -459,6 +460,7 @@ def run_virtual_sensor_job(
             float(true_tf_np[0]),
         ))
         sq_errors.append((init_mean - true_tf_np[0]) ** 2)
+        spreads.append(init_std)
 
         # ── t[1] … t[n_steps-1]: predict → assimilate → record ──────────────
         for i in range(1, n_steps):
@@ -480,6 +482,7 @@ def run_virtual_sensor_job(
                 float(true_tf_np[i]),
             ))
             sq_errors.append((t_fuel_mean - true_tf_np[i]) ** 2)
+            spreads.append(t_fuel_std)
 
             # Flush to TimescaleDB when the buffer is full.
             # execute_values sends one large VALUES clause per call —
@@ -504,13 +507,40 @@ def run_virtual_sensor_job(
         # Stop the simulation timer immediately after all I/O is complete.
         execution_time_s: float = time.perf_counter() - t_sim_start
 
-        # ── 7. Compute RMSE and transition to completed ───────────────────────
+        # ── 7. Compute RMSE, Spread-Skill ratio, CRPS and transition ─────────
         finite_sq = [e for e in sq_errors if math.isfinite(e)]
         rmse_K = math.sqrt(sum(finite_sq) / len(finite_sq)) if finite_sq else float('nan')
+
+        # Spread-Skill ratio: mean ensemble std / RMSE.
+        # A perfectly calibrated ensemble yields ratio ≈ 1.0.
+        # ratio >> 1 → overconfident (too narrow); << 1 → underdispersed.
+        mean_spread_K = float(np.mean(spreads)) if spreads else float('nan')
+        spread_skill_ratio = (
+            mean_spread_K / rmse_K
+            if (math.isfinite(rmse_K) and rmse_K > 0.0)
+            else float('nan')
+        )
+
+        # Final-step CRPS on the T_fuel posterior ensemble.
+        # Measures simultaneous accuracy + sharpness of the terminal posterior.
+        try:
+            _final_diag = calculate_diagnostics(
+                sensor.solver._y[:, 7],    # T_fuel posterior ensemble (N,)
+                float(true_tf_np[-1]),
+            )
+            final_crps_K     = _final_diag["crps_K"]
+            final_ss_ratio   = _final_diag["spread_skill_ratio"]
+        except Exception:
+            final_crps_K     = float('nan')
+            final_ss_ratio   = float('nan')
+
         logger.info(
             "run_id=%s: assimilation done — %d rows stored, RMSE=%.4f K, "
-            "device=%s, elapsed=%.2f s",
-            run_id, rows_inserted, rmse_K, effective_device, execution_time_s,
+            "mean_spread=%.4f K, spread/RMSE=%.3f (ideal=1.0), "
+            "final_CRPS=%.4f K, device=%s, elapsed=%.2f s",
+            run_id, rows_inserted, rmse_K,
+            mean_spread_K, spread_skill_ratio, final_crps_K,
+            effective_device, execution_time_s,
         )
 
         run_obj.status         = "completed"
@@ -522,13 +552,16 @@ def run_virtual_sensor_job(
         logger.info("run_id=%s [virtual_sensor]: status → completed", run_id)
 
         return {
-            "status":           "completed",
-            "run_id":           run_id,
-            "points":           rows_inserted,
-            "rmse_K":           rmse_K,
-            "execution_time_s": execution_time_s,
-            "device_used":      effective_device,
-            "device_reason":    device_reason,
+            "status":             "completed",
+            "run_id":             run_id,
+            "points":             rows_inserted,
+            "rmse_K":             rmse_K,
+            "mean_spread_K":      mean_spread_K,
+            "spread_skill_ratio": spread_skill_ratio,
+            "final_crps_K":       final_crps_K,
+            "execution_time_s":   execution_time_s,
+            "device_used":        effective_device,
+            "device_reason":      device_reason,
         }
 
     except Exception as exc:

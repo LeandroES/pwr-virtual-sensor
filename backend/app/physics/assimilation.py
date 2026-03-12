@@ -171,6 +171,13 @@ class AssimilationStep:
     posterior_T_fuel_mean_K: float  # x̄_a[7]  — ESTIMATED hidden fuel temperature
     posterior_T_fuel_var_K2: float  # Var(X_a[:, 7]) — uncertainty of the estimate
 
+    # ── Innovation diagnostics (filter consistency) ───────────────────────────
+    # A statistically consistent filter satisfies:  E[(d^i)²] ≈ S
+    # i.e.  innovation_rms_K ≈ sqrt(S)  where S = H P_f H^T + R.
+    # Persistent deviation indicates model error or mistuned R.
+    innovation_rms_K: float  # √E[(d^i)²]  — chi-squared consistency metric [K]
+    innovation_std_K: float  # std(d^i)    — spread of the innovation ensemble [K]
+
 
 # ── Main filter class ─────────────────────────────────────────────────────────
 
@@ -427,6 +434,15 @@ class EnKFSensor:
 
         innovation_mean: float = self._d.mean().item()
 
+        # ── Innovation diagnostics ────────────────────────────────────────────
+        # Chi-squared consistency test: for a well-calibrated filter,
+        #   E[(d^i)²]  ≈  S  =  H P_f H^T + R
+        # i.e.  innovation_rms ≈ sqrt(S.item()).
+        # A persistent innovation_rms >> sqrt(S) signals model error or
+        # an underestimated process noise covariance Q.
+        innovation_rms: float = torch.sqrt((self._d ** 2).mean()).item()
+        innovation_std: float = self._d.std(correction=1).item()
+
         # ── Analysis update: x_a^i = x_f^i + K d^i ─────────────────────────
         #
         # Matrix form for all N members at once:
@@ -476,6 +492,8 @@ class EnKFSensor:
             innovation_mean_K=innovation_mean,
             posterior_T_fuel_mean_K=T_f_mean,
             posterior_T_fuel_var_K2=T_f_var,
+            innovation_rms_K=innovation_rms,
+            innovation_std_K=innovation_std,
         ))
 
         return T_f_mean, T_f_var
@@ -579,6 +597,115 @@ class EnKFSensor:
 
 
 # ── Module-level utility ──────────────────────────────────────────────────────
+
+@_no_grad
+def calculate_diagnostics(
+    ensemble_col: "torch.Tensor",
+    true_value: float,
+) -> dict[str, float]:
+    """
+    Compute ensemble calibration diagnostics for a single scalar state variable.
+
+    A perfectly calibrated probabilistic forecast satisfies the *spread-skill*
+    identity:
+
+        σ_ens  ≈  RMSE
+
+    where σ_ens is the ensemble standard deviation and RMSE is measured over
+    a temporal sequence.  For a single step this reduces to:
+
+        spread_skill_ratio  =  σ_ens / |μ_ens − y_true|  ≈  1
+
+    The function also evaluates the **Continuous Ranked Probability Score**
+    (CRPS), which simultaneously assesses accuracy and sharpness.  For a
+    scalar forecast the CRPS is defined via the energy score decomposition
+    (Gneiting & Raftery 2007):
+
+        CRPS(X, y) = E|X − y|  −  ½ E|X − X'|
+
+    where  X, X'  are independent draws from the ensemble distribution.
+    The expected pairwise distance is computed in O(N log N) by exploiting
+    the sorted-ensemble identity (Ferro et al. 2008):
+
+        E|X − X'| = (2/N²) Σⱼ (2j − N + 1) x_(j)   (j = 0 … N−1, 0-indexed)
+
+    A lower CRPS indicates a sharper and more accurate forecast.  Unlike
+    the MAE, the CRPS penalises overconfident (too narrow) ensembles.
+
+    Parameters
+    ----------
+    ensemble_col : torch.Tensor, shape (N,)
+        Posterior ensemble samples for one state variable.
+        For the PWR virtual sensor this is typically ``solver._y[:, 7]``
+        (T_fuel posterior).  Any floating-point dtype is accepted.
+    true_value : float
+        Reference (ground-truth) value for the same variable at this step.
+        In the virtual sensor pipeline this is ``true_tf_np[i]``.
+
+    Returns
+    -------
+    dict[str, float]
+        spread_K          : ensemble standard deviation σ_ens  [K]
+        error_K           : |μ_ens − y_true|                   [K]
+        crps_K            : CRPS energy score                   [K]
+        spread_skill_ratio: σ_ens / max(|μ_ens − y_true|, ε)
+                            Ideal value = 1.0 (perfectly calibrated).
+                            > 1 → overconfident; < 1 → underdispersed.
+
+    Notes
+    -----
+    For a sequence of T assimilation steps:
+    - time-averaged CRPS is the primary scalar metric for filter quality
+    - mean(spread_skill_ratio) ≈ 1 confirms calibration
+    - A rank histogram (Talagrand 1997) provides a visual calibration check
+      that is complementary to these scalar summaries
+    """
+    _require_torch()
+
+    x: torch.Tensor = ensemble_col.detach()   # (N,) — no gradient tracking
+    N: int = x.shape[0]
+
+    # ── Ensemble moments ──────────────────────────────────────────────────────
+    mu:     torch.Tensor = x.mean()
+    spread: torch.Tensor = x.std(correction=1)
+    error:  torch.Tensor = (mu - true_value).abs()
+
+    # ── CRPS: Term 1 — mean absolute error of all members vs truth ────────────
+    #
+    #   E|X − y|  =  (1/N) Σᵢ |x^i − y|
+    #
+    mae_term: torch.Tensor = (x - true_value).abs().mean()
+
+    # ── CRPS: Term 2 — expected pairwise distance E|X − X'| ──────────────────
+    #
+    # Direct computation is O(N²); the sorted-ensemble trick reduces it to
+    # O(N log N).  For 0-indexed j ∈ {0, …, N−1}:
+    #
+    #   E|X − X'| = (2/N²) Σⱼ (2j − N + 1) · x_(j)
+    #
+    # where x_(j) is the j-th order statistic (sorted ascending).
+    #
+    # Derivation: each x_(j) participates in N(N−1) ordered pairs; it
+    # contributes positively in (N − 1 − j)·j pairs and negatively in the
+    # remaining pairs.  The net coefficient (2j − N + 1) follows.
+    x_sorted: torch.Tensor = x.sort().values                      # (N,)
+    j_idx = torch.arange(N, dtype=x.dtype, device=x.device)       # (N,)
+    weights  = 2.0 * j_idx - N + 1.0                              # (N,)
+    pairwise: torch.Tensor = (2.0 / (N * N)) * (weights * x_sorted).sum()
+
+    crps: torch.Tensor = mae_term - 0.5 * pairwise                # CRPS ≥ 0
+
+    # ── Spread-skill ratio ────────────────────────────────────────────────────
+    _guard: float = max(error.item(), 1e-6 * max(spread.item(), 1.0))
+    ss_ratio: float = spread.item() / _guard
+
+    return {
+        "spread_K":           spread.item(),
+        "error_K":            error.item(),
+        "crps_K":             crps.item(),
+        "spread_skill_ratio": ss_ratio,
+    }
+
 
 def _inflate_ensemble(X: torch.Tensor, alpha: float) -> None:
     """
