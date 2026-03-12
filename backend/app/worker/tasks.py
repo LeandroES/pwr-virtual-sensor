@@ -514,33 +514,50 @@ def run_virtual_sensor_job(
         # Spread-Skill ratio: mean ensemble std / RMSE.
         # A perfectly calibrated ensemble yields ratio ≈ 1.0.
         # ratio >> 1 → overconfident (too narrow); << 1 → underdispersed.
-        mean_spread_K = float(np.mean(spreads)) if spreads else float('nan')
-        spread_skill_ratio = (
+        #
+        # Filter NaN entries in spreads (can occur when t_fuel_var is NaN due
+        # to ensemble collapse under extreme observation noise).
+        finite_spreads = [s for s in spreads if math.isfinite(s)]
+        mean_spread_K: float | None = (
+            float(np.mean(finite_spreads)) if finite_spreads else None
+        )
+        spread_skill_ratio: float | None = (
             mean_spread_K / rmse_K
-            if (math.isfinite(rmse_K) and rmse_K > 0.0)
-            else float('nan')
+            if (mean_spread_K is not None
+                and math.isfinite(rmse_K)
+                and rmse_K > 0.0)
+            else None
         )
 
         # Final-step CRPS on the T_fuel posterior ensemble.
         # Measures simultaneous accuracy + sharpness of the terminal posterior.
+        # calculate_diagnostics already filters non-finite members internally.
+        final_crps_K:   float | None = None
+        final_ss_ratio: float | None = None
         try:
             _final_diag = calculate_diagnostics(
                 sensor.solver._y[:, 7],    # T_fuel posterior ensemble (N,)
                 float(true_tf_np[-1]),
             )
-            final_crps_K     = _final_diag["crps_K"]
-            final_ss_ratio   = _final_diag["spread_skill_ratio"]
+            _crps = _final_diag["crps_K"]
+            _ssr  = _final_diag["spread_skill_ratio"]
+            final_crps_K   = _crps if math.isfinite(_crps) else None
+            final_ss_ratio = _ssr  if math.isfinite(_ssr)  else None
         except Exception:
-            final_crps_K     = float('nan')
-            final_ss_ratio   = float('nan')
+            pass   # remain None — logged below as 'N/A'
+
+        # Format None values as 'N/A' in the log line to avoid %.f formatting
+        # failures and to make filter divergence clearly visible in log output.
+        def _fmt(v: float | None, spec: str = ".4f") -> str:
+            return format(v, spec) if v is not None else "N/A"
 
         logger.info(
-            "run_id=%s: assimilation done — %d rows stored, RMSE=%.4f K, "
-            "mean_spread=%.4f K, spread/RMSE=%.3f (ideal=1.0), "
-            "final_CRPS=%.4f K, device=%s, elapsed=%.2f s",
-            run_id, rows_inserted, rmse_K,
-            mean_spread_K, spread_skill_ratio, final_crps_K,
-            effective_device, execution_time_s,
+            "run_id=%s: assimilation done — %d rows stored, RMSE=%s K, "
+            "mean_spread=%s K, spread/RMSE=%s (ideal=1.0), "
+            "final_CRPS=%s K, device=%s, elapsed=%.2f s",
+            run_id, rows_inserted, _fmt(rmse_K if math.isfinite(rmse_K) else None),
+            _fmt(mean_spread_K), _fmt(spread_skill_ratio, ".3f"),
+            _fmt(final_crps_K), effective_device, execution_time_s,
         )
 
         run_obj.status         = "completed"
@@ -551,14 +568,20 @@ def run_virtual_sensor_job(
         db.commit()
         logger.info("run_id=%s [virtual_sensor]: status → completed", run_id)
 
+        # Sanitise float metrics before returning: NaN is not valid JSON
+        # (Celery serialises task results as JSON by default), so any metric
+        # that could not be computed is returned as None instead.
+        def _safe(v: float | None) -> float | None:
+            return v if (v is not None and math.isfinite(v)) else None
+
         return {
             "status":             "completed",
             "run_id":             run_id,
             "points":             rows_inserted,
-            "rmse_K":             rmse_K,
-            "mean_spread_K":      mean_spread_K,
-            "spread_skill_ratio": spread_skill_ratio,
-            "final_crps_K":       final_crps_K,
+            "rmse_K":             _safe(rmse_K),
+            "mean_spread_K":      _safe(mean_spread_K),
+            "spread_skill_ratio": _safe(spread_skill_ratio),
+            "final_crps_K":       _safe(final_crps_K),
             "execution_time_s":   execution_time_s,
             "device_used":        effective_device,
             "device_reason":      device_reason,

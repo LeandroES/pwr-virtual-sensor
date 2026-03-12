@@ -662,19 +662,44 @@ def calculate_diagnostics(
     """
     _require_torch()
 
-    x: torch.Tensor = ensemble_col.detach()   # (N,) — no gradient tracking
-    N: int = x.shape[0]
+    # ── Sanitise: remove non-finite ensemble members ──────────────────────────
+    # High observation noise can drive isolated members to NaN/±Inf when a
+    # large Kalman gain amplifies the innovation.  We filter rather than clamp
+    # so that pathological members do not bias the ensemble moments.
+    x: torch.Tensor       = ensemble_col.detach()
+    valid_mask: torch.Tensor = torch.isfinite(x)        # (N,) bool
+    n_finite: int            = int(valid_mask.sum().item())
+
+    _NaN_RESULT: dict[str, float] = {
+        "spread_K":           float('nan'),
+        "error_K":            float('nan'),
+        "crps_K":             float('nan'),
+        "spread_skill_ratio": float('nan'),
+        "n_finite_members":   float(n_finite),
+    }
+
+    if n_finite < 2:
+        # Bessel-corrected variance is undefined for fewer than 2 finite members.
+        return _NaN_RESULT
+
+    x_clean: torch.Tensor = x[valid_mask]               # (n_finite,) all finite
+    N: int = n_finite
 
     # ── Ensemble moments ──────────────────────────────────────────────────────
-    mu:     torch.Tensor = x.mean()
-    spread: torch.Tensor = x.std(correction=1)
+    mu: torch.Tensor = x_clean.mean()
+
+    # clamp(min=0) prevents sqrt of a tiny negative float caused by FP round-off
+    # in the Bessel correction when all members are nearly identical (filter
+    # collapse).  It does NOT artificially inflate a truly zero spread — the
+    # spread_skill_ratio guard below handles the zero case explicitly.
+    spread: torch.Tensor = x_clean.var(correction=1).clamp(min=0.0).sqrt()
     error:  torch.Tensor = (mu - true_value).abs()
 
     # ── CRPS: Term 1 — mean absolute error of all members vs truth ────────────
     #
     #   E|X − y|  =  (1/N) Σᵢ |x^i − y|
     #
-    mae_term: torch.Tensor = (x - true_value).abs().mean()
+    mae_term: torch.Tensor = (x_clean - true_value).abs().mean()
 
     # ── CRPS: Term 2 — expected pairwise distance E|X − X'| ──────────────────
     #
@@ -688,22 +713,32 @@ def calculate_diagnostics(
     # Derivation: each x_(j) participates in N(N−1) ordered pairs; it
     # contributes positively in (N − 1 − j)·j pairs and negatively in the
     # remaining pairs.  The net coefficient (2j − N + 1) follows.
-    x_sorted: torch.Tensor = x.sort().values                      # (N,)
-    j_idx = torch.arange(N, dtype=x.dtype, device=x.device)       # (N,)
+    x_sorted: torch.Tensor = x_clean.sort().values                # (N,)
+    j_idx = torch.arange(N, dtype=x_clean.dtype, device=x_clean.device)  # (N,)
     weights  = 2.0 * j_idx - N + 1.0                              # (N,)
     pairwise: torch.Tensor = (2.0 / (N * N)) * (weights * x_sorted).sum()
 
     crps: torch.Tensor = mae_term - 0.5 * pairwise                # CRPS ≥ 0
 
     # ── Spread-skill ratio ────────────────────────────────────────────────────
-    _guard: float = max(error.item(), 1e-6 * max(spread.item(), 1.0))
-    ss_ratio: float = spread.item() / _guard
+    # Two-level guard:
+    #   (1) verify both operands are finite after filtering
+    #   (2) denominator floor prevents divide-by-zero for a point-truth that
+    #       equals the ensemble mean exactly (or filter collapse with spread=0)
+    _spread_f: float = spread.item()
+    _error_f:  float = error.item()
+    if math.isfinite(_spread_f) and math.isfinite(_error_f):
+        _denom = max(_error_f, max(_spread_f, 1.0) * 1e-6)
+        ss_ratio: float = _spread_f / _denom
+    else:
+        ss_ratio = float('nan')
 
     return {
-        "spread_K":           spread.item(),
-        "error_K":            error.item(),
+        "spread_K":           _spread_f,
+        "error_K":            _error_f,
         "crps_K":             crps.item(),
         "spread_skill_ratio": ss_ratio,
+        "n_finite_members":   float(n_finite),
     }
 
 
