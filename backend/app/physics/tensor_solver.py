@@ -95,8 +95,18 @@ def _no_grad(fn: Any) -> Any:
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-_DT_MAX: float = 0.01      # [s] RK4 stability ceiling for PWR PKE stiffness
-_DEFAULT_N: int = 100_000  # default ensemble size
+_DT_MAX:   float = 0.01      # [s] RK4 stability ceiling for PWR PKE stiffness
+_DT_MICRO: float = 0.001    # [s] sub-step ceiling for adaptive sub-stepping
+_DEFAULT_N: int  = 100_000  # default ensemble size
+
+# ── Physical clipping bounds ──────────────────────────────────────────────────
+# Applied after every RK4 micro-step to prevent stochastic ensemble members
+# from escaping the physically realisable region of state space.
+# These are generous engineering limits, not operational setpoints — they only
+# catch numerical divergence, not real transient excursions.
+_T_MIN_K: float = 273.0    # 0 °C  — no PWR state below ice point
+_T_MAX_K: float = 5000.0   # far above UO₂ melting (~3100 K): catches blow-up
+_N_MIN:   float = 1e-12    # positivity floor for n and Cᵢ (dimensionless)
 
 # Observable name → state-vector column index
 _OBS_INDEX: dict[str, int] = {
@@ -479,21 +489,18 @@ class EnsembleSolver:
 
     # ─────────────────────────────────────────────────────────── RK4 step ──
 
-    def step(self, dt: float) -> None:
+    def _rk4_inplace(self, dt: float) -> None:
         """
-        Advance all N ensemble members by one classical RK4 step, in-place.
+        Single classical RK4 micro-step, mutating ``self._y`` in-place.
 
-        All six (N,9) scratch tensors are reused; no heap allocation occurs
-        during this method.  Suitable for tight integration loops.
+        No heap allocation — reuses the six pre-allocated (N,9) scratch
+        tensors.  Called exclusively from ``step()``.
 
         Parameters
         ----------
         dt : float
-            Integration step size [s].  Must satisfy dt ≤ 0.01 s for RK4
-            stability with PWR-typical stiffness (|s₀| ≈ 325 s⁻¹).
+            Micro-step size [s].  The caller (``step``) guarantees dt ≤ _DT_MICRO.
         """
-        assert self._initialized, "Call initialize() before step()."
-
         y, k1, k2, k3, k4, y_tmp = (
             self._y, self._k1, self._k2, self._k3, self._k4, self._y_tmp
         )
@@ -521,6 +528,66 @@ class EnsembleSolver:
         y_tmp.add_(k2, alpha=2.0)               # + 2k2
         y_tmp.add_(k3, alpha=2.0)               # + 2k3
         y.add_(y_tmp, alpha=sixth)              # y += h/6 · (...)
+
+    def _clip_physical(self) -> None:
+        """
+        Enforce physical bounds in-place on all N ensemble members.
+
+        Applied after every RK4 micro-step so that stochastic perturbations
+        or large Kalman-gain updates cannot push members into unphysical
+        regions of state space (negative populations, sub-zero temperatures).
+
+        All operations use ``torch.Tensor.clamp_()`` — strictly in-place,
+        zero additional VRAM allocation, no Python loop over N.
+
+        Bounds
+        ------
+        T_fuel, T_coolant   →  [_T_MIN_K = 273 K,  _T_MAX_K = 5000 K]
+        n, C₁ … C₆         →  [_N_MIN   = 1e-12,  +∞)
+        """
+        # ── Temperature columns (indices 7 and 8) ────────────────────────────
+        # clamp_ on a column view is in-place on the underlying storage.
+        self._y[:, 7].clamp_(min=_T_MIN_K, max=_T_MAX_K)   # T_fuel
+        self._y[:, 8].clamp_(min=_T_MIN_K, max=_T_MAX_K)   # T_coolant
+
+        # ── Neutron population (index 0) and precursors (indices 1-6) ────────
+        # The PKE system is stiff and exponentially decaying for subcritical
+        # states; clamp_ at 1e-12 prevents floating-point underflow driving
+        # members exactly to zero where 1/n divisions in ρ would diverge.
+        self._y[:, 0].clamp_(min=_N_MIN)       # n
+        self._y[:, 1:7].clamp_(min=_N_MIN)     # C₁ … C₆
+
+    def step(self, dt: float) -> None:
+        """
+        Advance all N ensemble members by ``dt`` seconds, in-place.
+
+        **Sub-stepping (Técnica 5)**: if ``dt > _DT_MICRO`` the interval is
+        divided into ``n_sub = ⌈dt / _DT_MICRO⌉`` equal micro-steps of size
+        ``dt / n_sub``.  For the default ceiling ``_DT_MICRO = 0.001 s`` and
+        the API maximum ``dt = 0.01 s`` this gives at most 10 micro-steps.
+        Each micro-step is a full RK4 pass over all N members (GPU-vectorised).
+
+        **Physical clipping (Técnica 2)**: after every micro-step,
+        ``_clip_physical()`` enforces physical bounds in-place with
+        ``torch.clamp_()`` — no allocation, no Python loop over N.
+
+        Parameters
+        ----------
+        dt : float
+            Integration step size [s].  Must satisfy dt ≤ 0.01 s
+            (enforced upstream by ``_validate_time_args``).
+        """
+        assert self._initialized, "Call initialize() before step()."
+
+        # ── Adaptive sub-stepping ─────────────────────────────────────────────
+        # n_sub micro-steps of size dt_sub = dt / n_sub.
+        # This is a loop over time sub-steps (max 10), NOT over N members.
+        n_sub:  int   = max(1, math.ceil(dt / _DT_MICRO))
+        dt_sub: float = dt / n_sub
+
+        for _ in range(n_sub):
+            self._rk4_inplace(dt_sub)
+            self._clip_physical()
 
     # ──────────────────────────────────────────── EnKF assimilation step ──
 

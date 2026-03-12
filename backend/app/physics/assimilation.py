@@ -112,6 +112,15 @@ _IDX_C   = slice(1, 7) # delayed-neutron precursor groups C₁ … C₆
 _IDX_T_F = 7           # average fuel temperature  T_f  [K]  ← HIDDEN
 _IDX_T_C = 8           # average coolant temperature  T_c  [K]  ← OBSERVABLE
 
+# ── Tikhonov regularisation for the innovation covariance ─────────────────────
+# Added to every diagonal element of S = H P_f H^T + R before the linear solve.
+# Physical interpretation: a floor of 1e-6 K² on the innovation variance,
+# equivalent to a fictitious measurement noise of ≈ 0.001 K.  This is six
+# orders of magnitude below any realistic RTD noise (≥ 0.01 K²), so it does
+# not bias the Kalman gain in normal operation but prevents a singular S when
+# the ensemble collapses (P_f → 0) under repeated assimilation.
+_S_TIKHONOV: float = 1e-6   # [K²]
+
 
 # ── Configuration dataclass ───────────────────────────────────────────────────
 
@@ -364,6 +373,14 @@ class EnKFSensor:
 
         HPH_T: torch.Tensor = H @ P_f @ H.T    # (1, 9) @ (9, 9) @ (9, 1) → (1, 1)
         S:     torch.Tensor = HPH_T + R         # (1, 1)
+
+        # ── Tikhonov regularisation (Técnica 4) ──────────────────────────────
+        # Adds _S_TIKHONOV to every diagonal element of S in-place.
+        # S.diagonal() returns a view into S's storage — no allocation.
+        # For the current m=1 case this is equivalent to S[0,0] += ε.
+        # For a future m>1 multi-sensor extension no code change is required:
+        # diagonal() generalises automatically to ℝ^{m×m}.
+        S.diagonal().add_(_S_TIKHONOV)
 
         # ════════════════════════════════════════════════════════════════════
         # (d)  KALMAN GAIN  K ∈ ℝ^{9×1}
