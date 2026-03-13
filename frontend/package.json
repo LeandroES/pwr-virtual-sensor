@@ -11,6 +11,8 @@
   "dependencies": {
     "@tanstack/react-query": "^5.56.0",
     "axios": "^1.7.7",
+    "echarts": "^6.0.0",
+    "echarts-for-react": "^3.0.6",
     "html2canvas": "^1.4.1",
     "i18next": "^25.8.17",
     "jspdf": "^4.2.0",

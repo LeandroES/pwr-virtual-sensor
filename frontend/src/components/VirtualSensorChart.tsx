@@ -1,227 +1,421 @@
 /**
- * VirtualSensorChart — ComposedChart for the EnKF Virtual Sensor output.
+ * VirtualSensorChart — Canvas-based EnKF Virtual Sensor chart via Apache ECharts.
  *
  * Rendering strategy:
- *   - No point reduction: all data points are rendered.
- *   - Horizontal scroll: the inner ComposedChart has a dynamic fixed pixel
- *     width (min 3 000 px, then 4 px × N points).  The outer container uses
- *     overflow-x-auto so the chart scrolls without compressing.
- *   - The custom legend is rendered OUTSIDE the scrollable area so it stays
- *     visible at all times and drives line-highlight interaction.
+ *   All data points from the API are passed directly to ECharts (Canvas renderer).
+ *   No client-side subsampling. ECharts handles 6,001+ points natively on canvas.
  *
- * Four overlaid data series (bottom → top render order):
- *
- *   1. Area  [ci_upper]   — fills from y-axis floor to +2σ bound  (cyan, 15% opacity)
- *   2. Area  [ci_lower]   — masks from y-axis floor to −2σ bound  (bg colour = invisible)
- *        ↳  Together these two areas create the ±2σ confidence band.
- *
- *   3. Line  [tf_true]    — ground-truth T_fuel from ScipySolver   (coral dashed)
- *   4. Line  [tf_mean]    — EnKF posterior mean T_fuel              (electric cyan solid)
- *   5. Line  [noisy_tc]   — noisy RTD coolant readings (dots only)  (neon yellow dots)
+ * Four overlaid data series:
+ *   1. CI ±2σ band  — stacked area pair [ci_lower base + ci_range delta]  (cyan, 15% opacity)
+ *   2. True T_fuel  — ground truth from ScipySolver                        (coral dashed)
+ *   3. Inferred T_fuel — EnKF posterior mean                               (electric cyan solid)
+ *   4. Noisy RTD    — T_coolant + Gaussian noise (scatter dots)            (neon yellow)
  *
  * Dual Y-axis layout:
- *   Left  (yAxisId="fuel")  — T_fuel range  [°C] — inference + CI + ground truth
- *   Right (yAxisId="cool")  — T_coolant range [°C] — RTD readings
+ *   Left  (yAxisIndex 0) — T_fuel  [°C] — inference + CI + ground truth
+ *   Right (yAxisIndex 1) — T_coolant [°C] — RTD readings
  *
  * Interactivity:
- *   Hovering a legend item highlights that series and dims the rest to 0.15
- *   opacity.  Mouse-leave restores all series to full opacity.
+ *   - dataZoom slider (bottom rail) and mouse-wheel scroll zoom on X axis
+ *   - Legend click: toggle series visibility
+ *   - Legend hover: focus the hovered series, blur the rest (ECharts emphasis)
+ *   - Axis-aligned tooltip showing all values at the cursor time
  */
-import React, { useState, useMemo } from 'react'
+import React, { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import {
-  ComposedChart,
-  Area,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ReferenceLine,
-  type TooltipProps,
-} from 'recharts'
+import ReactECharts from 'echarts-for-react'
+import type { EChartsOption } from 'echarts'
 import type { SensorResultPoint } from '../types'
 
-// ── Chart background — must match the wrapper div's bg for the CI mask trick ──
-const CHART_BG = '#0f172a'   // slate-950
-
-// ── High-contrast colour palette ─────────────────────────────────────────────
-const C_INFERRED = '#00e5ff'               // electric cyan (Material A400)
-const C_TRUE     = '#ff5252'               // coral red     (Material A200)
+// ── Corporate colour palette ──────────────────────────────────────────────────
+const CHART_BG   = '#0f172a'                // slate-950
+const C_INFERRED = '#00e5ff'                // electric cyan  (Material A400)
+const C_TRUE     = '#ff5252'                // coral red      (Material A200)
 const C_CI_FILL  = 'rgba(0,229,255,0.15)'  // cyan CI band fill
-const C_NOISE    = '#ffea00'               // neon yellow   (Material A400)
-const C_GRID     = 'rgba(51,65,85,0.5)'   // slate-700 translucent grid
+const C_NOISE    = '#ffea00'                // neon yellow    (Material A400)
+const C_GRID     = 'rgba(51,65,85,0.5)'    // slate-700 translucent
+const C_AXIS     = '#475569'               // slate-600
+const C_TICK     = '#94a3b8'               // slate-400
+const C_TEXT     = '#94a3b8'
 
-// ── Legend series keys ────────────────────────────────────────────────────────
-type SeriesKey = 'tf_mean' | 'ci_band' | 'tf_true' | 'noisy_tc'
+// ── Legend series identifiers (must match series names) ───────────────────────
+const S_INFERRED = 'Inferred T_fuel (EnKF)'
+const S_CI       = 'CI ±2σ (95%)'
+const S_TRUE     = 'True T_fuel'
+const S_RTD      = 'Noisy RTD'
+const S_CI_BASE  = '__ci_base__'           // internal stacking helper, hidden from legend
 
-// ── Derived chart shape ───────────────────────────────────────────────────────
+// ── Data transformation ───────────────────────────────────────────────────────
 
-interface ChartRow {
-  t:        number   // sim_time_s [s]
-  tf_mean:  number   // inferred T_fuel [°C]
-  tf_true:  number   // ground-truth T_fuel [°C]
-  noisy_tc: number   // noisy RTD T_coolant [°C]
-  ci_upper: number   // mean + 2σ [°C]
-  ci_lower: number   // mean − 2σ [°C]
+interface SeriesArrays {
+  times:       number[]
+  tfMean:      [number, number][]
+  tfTrue:      [number, number][]
+  noisyTc:     [number, number][]
+  ciBase:      [number, number][]   // ci_lower (°C)
+  ciRange:     [number, number][]   // ci_upper − ci_lower (delta, stacked on top)
+  fuelMin:     number
+  fuelMax:     number
+  coolMin:     number
+  coolMax:     number
 }
 
-function toChartRows(data: SensorResultPoint[]): ChartRow[] {
-  return data
-    .filter((p) => p.inferred_t_fuel_mean != null && isFinite(p.inferred_t_fuel_mean))
-    .map((p) => {
-      const twoSigma = 2 * (p.inferred_t_fuel_std ?? 0)
-      return {
-        t:        p.sim_time_s,
-        tf_mean:  p.inferred_t_fuel_mean - 273.15,
-        tf_true:  p.true_t_fuel          - 273.15,
-        noisy_tc: p.noisy_t_coolant      - 273.15,
-        ci_upper: p.inferred_t_fuel_mean - 273.15 + twoSigma,
-        ci_lower: p.inferred_t_fuel_mean - 273.15 - twoSigma,
-      }
-    })
-}
-
-// ── Custom tooltip ────────────────────────────────────────────────────────────
-
-function EnKFTooltip({ active, payload, label }: TooltipProps<number, string>) {
-  const { t } = useTranslation()
-  if (!active || !payload || payload.length === 0) return null
-
-  const byKey: Record<string, number> = {}
-  payload.forEach((e) => { if (e.dataKey) byKey[e.dataKey as string] = e.value as number })
-
-  const rows = [
-    { name: t('chart.tfInferred'), value: byKey.tf_mean,  color: C_INFERRED, unit: '°C' },
-    { name: t('chart.tfTrue'),     value: byKey.tf_true,  color: C_TRUE,     unit: '°C' },
-    { name: t('chart.rtdNoisy'),   value: byKey.noisy_tc, color: C_NOISE,    unit: '°C' },
-    { name: t('chart.ciUpper'),    value: byKey.ci_upper, color: '#93c5fd',  unit: '°C' },
-    { name: t('chart.ciLower'),    value: byKey.ci_lower, color: '#93c5fd',  unit: '°C' },
-  ].filter((r) => r.value !== undefined && !isNaN(r.value))
-
-  const error = byKey.tf_mean !== undefined && byKey.tf_true !== undefined
-    ? byKey.tf_mean - byKey.tf_true
-    : null
-
-  return (
-    <div
-      className="rounded-lg border border-slate-600 text-xs shadow-xl"
-      style={{ background: 'rgba(15,23,42,0.96)', backdropFilter: 'blur(4px)' }}
-    >
-      <p className="px-3 pt-2.5 pb-1.5 font-mono font-semibold text-cyan-300 border-b border-slate-700">
-        t = {Number(label).toFixed(3)} s
-      </p>
-      <div className="px-3 py-2 space-y-1">
-        {rows.map((r) => (
-          <div key={r.name} className="flex items-center justify-between gap-5">
-            <span style={{ color: r.color }} className="font-medium">{r.name}</span>
-            <span className="font-mono text-slate-200 tabular-nums">
-              {r.value.toFixed(3)} {r.unit}
-            </span>
-          </div>
-        ))}
-        {error !== null && (
-          <div className="flex items-center justify-between gap-5 border-t border-slate-700 pt-1 mt-1">
-            <span className="text-slate-400">{t('chart.instantError')}</span>
-            <span
-              className="font-mono tabular-nums font-semibold"
-              style={{ color: Math.abs(error) < 1 ? '#4ade80' : '#ff5252' }}
-            >
-              {error >= 0 ? '+' : ''}{error.toFixed(3)} K
-            </span>
-          </div>
-        )}
-      </div>
-    </div>
+function buildSeriesArrays(data: SensorResultPoint[]): SeriesArrays {
+  const valid = data.filter(
+    (p) => p.inferred_t_fuel_mean != null && isFinite(p.inferred_t_fuel_mean),
   )
+
+  const tfMean:  [number, number][] = []
+  const tfTrue:  [number, number][] = []
+  const noisyTc: [number, number][] = []
+  const ciBase:  [number, number][] = []
+  const ciRange: [number, number][] = []
+  const times:   number[]           = []
+
+  let fuelMin =  Infinity
+  let fuelMax = -Infinity
+  let coolMin =  Infinity
+  let coolMax = -Infinity
+
+  for (const p of valid) {
+    const t  = p.sim_time_s
+    const mf = p.inferred_t_fuel_mean - 273.15
+    const tt = p.true_t_fuel          - 273.15
+    const tc = p.noisy_t_coolant      - 273.15
+    const s2 = 2 * (p.inferred_t_fuel_std ?? 0)
+    const lo = mf - s2
+    const hi = mf + s2
+
+    times.push(t)
+    tfMean.push([t, mf])
+    tfTrue.push([t, tt])
+    noisyTc.push([t, tc])
+    ciBase.push([t, lo])
+    ciRange.push([t, hi - lo])  // stacked delta
+
+    if (lo < fuelMin) fuelMin = lo
+    if (hi > fuelMax) fuelMax = hi
+    if (tt < fuelMin) fuelMin = tt
+    if (tt > fuelMax) fuelMax = tt
+    if (tc < coolMin) coolMin = tc
+    if (tc > coolMax) coolMax = tc
+  }
+
+  const PAD = 0.5
+  return {
+    times,
+    tfMean, tfTrue, noisyTc, ciBase, ciRange,
+    fuelMin: isFinite(fuelMin) ? Math.floor(fuelMin - PAD)   : 600,
+    fuelMax: isFinite(fuelMax) ? Math.ceil(fuelMax  + PAD)   : 700,
+    coolMin: isFinite(coolMin) ? Math.floor(coolMin - PAD)   : 310,
+    coolMax: isFinite(coolMax) ? Math.ceil(coolMax  + PAD)   : 340,
+  }
 }
 
-// ── Interactive legend ────────────────────────────────────────────────────────
+// ── ECharts option builder ────────────────────────────────────────────────────
 
-interface LegendProps {
-  hoveredLine: SeriesKey | null
-  onHover: (key: SeriesKey | null) => void
+function buildOption(
+  sa: SeriesArrays,
+  nominalFuelC: number,
+  nominalCoolC: number,
+  labelInferred: string,
+  labelCI: string,
+  labelTrue: string,
+  labelRTD: string,
+  labelTimeAxis: string,
+  labelFuelAxis: string,
+  labelCoolAxis: string,
+  labelT: string,
+  labelTfInf: string,
+  labelTfTru: string,
+  labelRtdN: string,
+  labelErr: string,
+): EChartsOption {
+  return {
+    backgroundColor: CHART_BG,
+
+    animation: false,
+
+    // ── Grid ──────────────────────────────────────────────────────────────────
+    grid: {
+      top:    40,
+      right:  72,
+      bottom: 88,   // room for dataZoom slider
+      left:   64,
+    },
+
+    // ── Legend ────────────────────────────────────────────────────────────────
+    legend: {
+      top:         8,
+      left:        'center',
+      orient:      'horizontal',
+      selectedMode: true,          // click to toggle
+      data: [
+        { name: S_INFERRED, icon: 'path://M0,5 L28,5',
+          itemStyle: { color: C_INFERRED },
+          lineStyle: { color: C_INFERRED, width: 2.5 } },
+        { name: S_CI,       icon: 'roundRect',
+          itemStyle: { color: C_CI_FILL, borderColor: C_INFERRED, borderWidth: 1 } },
+        { name: S_TRUE,     icon: 'path://M0,5 L4,5 M8,5 L12,5 M16,5 L20,5 M24,5 L28,5',
+          itemStyle: { color: C_TRUE },
+          lineStyle: { color: C_TRUE, width: 1.5, type: 'dashed' } },
+        { name: S_RTD,      icon: 'circle',
+          itemStyle: { color: C_NOISE } },
+      ],
+      textStyle:     { color: C_TEXT, fontSize: 12, fontFamily: 'monospace' },
+      inactiveColor: '#334155',
+      emphasis:      { selectorLabel: { show: true } },
+    },
+
+    // ── Axes ──────────────────────────────────────────────────────────────────
+    xAxis: {
+      type:  'value',
+      name:  labelTimeAxis,
+      nameLocation: 'middle',
+      nameGap: 28,
+      nameTextStyle: { color: '#64748b', fontSize: 10, fontFamily: 'monospace' },
+      min: sa.times.length > 0 ? sa.times[0]  : 0,
+      max: sa.times.length > 0 ? sa.times[sa.times.length - 1] : 60,
+      axisLine:  { lineStyle: { color: C_AXIS } },
+      axisTick:  { lineStyle: { color: C_AXIS } },
+      axisLabel: {
+        color:       C_TICK,
+        fontSize:    10,
+        fontFamily:  'monospace',
+        formatter:   (v: number) => `${v.toFixed(1)}s`,
+      },
+      splitLine: { lineStyle: { color: C_GRID, type: 'dashed' } },
+    },
+
+    yAxis: [
+      // Left — T_fuel [°C]
+      {
+        type:         'value',
+        name:         labelFuelAxis,
+        nameLocation: 'middle',
+        nameGap:      44,
+        nameTextStyle: { color: C_INFERRED, fontSize: 10, fontFamily: 'monospace' },
+        min:    sa.fuelMin,
+        max:    sa.fuelMax,
+        axisLine:  { lineStyle: { color: C_AXIS } },
+        axisTick:  { lineStyle: { color: C_AXIS } },
+        axisLabel: {
+          color: C_INFERRED, fontSize: 10, fontFamily: 'monospace',
+          formatter: (v: number) => v.toFixed(1),
+        },
+        splitLine: { lineStyle: { color: C_GRID, type: 'dashed' } },
+      },
+      // Right — T_coolant [°C]
+      {
+        type:         'value',
+        name:         labelCoolAxis,
+        nameLocation: 'middle',
+        nameGap:      52,
+        nameTextStyle: { color: C_NOISE, fontSize: 10, fontFamily: 'monospace' },
+        min:    sa.coolMin,
+        max:    sa.coolMax,
+        axisLine:  { lineStyle: { color: C_AXIS } },
+        axisTick:  { lineStyle: { color: C_AXIS } },
+        axisLabel: {
+          color: C_NOISE, fontSize: 10, fontFamily: 'monospace',
+          formatter: (v: number) => v.toFixed(1),
+        },
+        splitLine: { show: false },
+      },
+    ],
+
+    // ── dataZoom — slider + mouse wheel ───────────────────────────────────────
+    dataZoom: [
+      {
+        type:       'slider',
+        xAxisIndex: 0,
+        bottom:     8,
+        height:     22,
+        borderColor:        '#334155',
+        fillerColor:        'rgba(0,229,255,0.08)',
+        handleStyle:        { color: C_INFERRED, borderColor: C_INFERRED },
+        moveHandleStyle:    { color: C_INFERRED },
+        selectedDataBackground: {
+          lineStyle: { color: C_INFERRED },
+          areaStyle: { color: 'rgba(0,229,255,0.1)' },
+        },
+        dataBackground: {
+          lineStyle: { color: '#334155' },
+          areaStyle: { color: 'rgba(51,65,85,0.3)' },
+        },
+        textStyle: { color: C_TICK, fontSize: 9, fontFamily: 'monospace' },
+        labelFormatter: (v: number) => `${Number(v).toFixed(1)}s`,
+      },
+      {
+        type:       'inside',
+        xAxisIndex: 0,
+        zoomOnMouseWheel: true,
+        moveOnMouseMove:  true,
+      },
+    ],
+
+    // ── Tooltip ───────────────────────────────────────────────────────────────
+    tooltip: {
+      trigger:   'axis',
+      axisPointer: {
+        type:      'cross',
+        lineStyle:  { color: '#475569', type: 'dashed', width: 1 },
+        crossStyle: { color: '#475569', width: 1 },
+      },
+      backgroundColor: 'rgba(15,23,42,0.96)',
+      borderColor:     '#475569',
+      borderWidth:     1,
+      padding:         0,
+      textStyle:       { color: '#e2e8f0', fontSize: 11, fontFamily: 'monospace' },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      formatter(params: any) {
+        if (!Array.isArray(params) || params.length === 0) return ''
+        const t: number = params[0].axisValue ?? params[0].data?.[0]
+        const byName: Record<string, number> = {}
+        for (const p of params) {
+          if (p.seriesName && p.data != null) {
+            byName[p.seriesName] = Array.isArray(p.data) ? p.data[1] : p.value
+          }
+        }
+
+        const tfm  = byName[S_INFERRED]
+        const tft  = byName[S_TRUE]
+        const rtd  = byName[S_RTD]
+        const ciLo = byName[S_CI_BASE]
+
+        const rows: Array<{ label: string; val: number; color: string }> = []
+        if (tfm  != null) rows.push({ label: labelTfInf, val: tfm,  color: C_INFERRED })
+        if (tft  != null) rows.push({ label: labelTfTru, val: tft,  color: C_TRUE     })
+        if (rtd  != null) rows.push({ label: labelRtdN,  val: rtd,  color: C_NOISE    })
+        if (ciLo != null && tfm != null) {
+          rows.push({ label: '95% CI lo', val: ciLo,      color: '#93c5fd' })
+          rows.push({ label: '95% CI hi', val: ciLo + (byName[S_CI] ?? 0), color: '#93c5fd' })
+        }
+
+        const err = tfm != null && tft != null ? tfm - tft : null
+
+        const rowsHtml = rows.map(
+          (r) =>
+            `<div style="display:flex;justify-content:space-between;gap:20px">
+               <span style="color:${r.color}">${r.label}</span>
+               <span style="font-family:monospace;color:#e2e8f0">${r.val.toFixed(3)} °C</span>
+             </div>`,
+        ).join('')
+
+        const errHtml = err != null
+          ? `<div style="display:flex;justify-content:space-between;gap:20px;border-top:1px solid #334155;margin-top:4px;padding-top:4px">
+               <span style="color:#94a3b8">${labelErr}</span>
+               <span style="font-family:monospace;font-weight:600;color:${Math.abs(err) < 1 ? '#4ade80' : '#ff5252'}">
+                 ${err >= 0 ? '+' : ''}${err.toFixed(3)} K
+               </span>
+             </div>`
+          : ''
+
+        return `<div style="min-width:230px;padding:0">
+          <div style="padding:8px 12px 6px;border-bottom:1px solid #334155;font-weight:600;color:#67e8f9;font-family:monospace">
+            ${labelT} = ${Number(t).toFixed(3)} s
+          </div>
+          <div style="padding:6px 12px 8px;display:flex;flex-direction:column;gap:3px">
+            ${rowsHtml}${errHtml}
+          </div>
+        </div>`
+      },
+    },
+
+    // ── Series ────────────────────────────────────────────────────────────────
+    series: [
+      // 1. CI base (ci_lower) — invisible line, transparent area, stacked foundation
+      {
+        name:        S_CI_BASE,
+        type:        'line' as const,
+        data:        sa.ciBase,
+        yAxisIndex:  0,
+        stack:       'ci_band',
+        symbol:      'none',
+        lineStyle:   { opacity: 0 },
+        areaStyle:   { color: 'transparent', opacity: 0 },
+        emphasis:    { disabled: true },
+        tooltip:     { show: true },   // needed so formatter gets the ci_lower value
+        legendHoverLink: false,
+        silent:      true,
+      },
+
+      // 2. CI range (ci_upper − ci_lower) — stacked on top, visible fill
+      {
+        name:       S_CI,
+        type:       'line' as const,
+        data:       sa.ciRange,
+        yAxisIndex: 0,
+        stack:      'ci_band',
+        symbol:     'none',
+        lineStyle:  { opacity: 0 },
+        areaStyle:  { color: C_CI_FILL, opacity: 1 },
+        emphasis:   { focus: 'self' as const, areaStyle: { color: 'rgba(0,229,255,0.30)' } },
+        blur:       { areaStyle: { opacity: 0.05 } },
+      },
+
+      // 3. Ground truth T_fuel (dashed coral)
+      {
+        name:       S_TRUE,
+        type:       'line' as const,
+        data:       sa.tfTrue,
+        yAxisIndex: 0,
+        symbol:     'none',
+        lineStyle:  { color: C_TRUE, width: 1.5, type: 'dashed' as const },
+        emphasis:   { focus: 'series' as const, lineStyle: { width: 2.5 } },
+        blur:       { lineStyle: { opacity: 0.12 } },
+        markLine: {
+          silent:    true,
+          symbol:    'none',
+          lineStyle: { color: 'rgba(0,229,255,0.25)', type: 'dashed', width: 1 },
+          label: {
+            formatter: 'T_f\u2080',
+            position: 'start',
+            fontSize: 9,
+            color: 'rgba(0,229,255,0.5)',
+            fontFamily: 'monospace',
+          },
+          data: [{ yAxis: nominalFuelC }],
+        },
+      },
+
+      // 4. EnKF posterior mean T_fuel (solid electric cyan)
+      {
+        name:       S_INFERRED,
+        type:       'line' as const,
+        data:       sa.tfMean,
+        yAxisIndex: 0,
+        symbol:     'none',
+        lineStyle:  { color: C_INFERRED, width: 2.5 },
+        emphasis:   { focus: 'series' as const, lineStyle: { width: 3.5 } },
+        blur:       { lineStyle: { opacity: 0.12 } },
+      },
+
+      // 5. Noisy RTD coolant readings (neon yellow scatter dots)
+      {
+        name:        S_RTD,
+        type:        'scatter' as const,
+        data:        sa.noisyTc,
+        yAxisIndex:  1,
+        symbolSize:  3,
+        itemStyle:   { color: C_NOISE, opacity: 0.75 },
+        large:       true,             // WebGL-accelerated scatter for dense clouds
+        largeThreshold: 500,
+        emphasis:    { focus: 'series' as const, itemStyle: { opacity: 1 } },
+        blur:        { itemStyle: { opacity: 0.06 } },
+        markLine: {
+          silent:    true,
+          symbol:    'none',
+          lineStyle: { color: 'rgba(255,234,0,0.2)', type: 'dashed', width: 1 },
+          label:     { show: false },
+          data: [{ yAxis: nominalCoolC }],
+        },
+      },
+    ],
+  }
 }
 
-function EnKFLegend({ hoveredLine, onHover }: LegendProps) {
-  const { t } = useTranslation()
-
-  const items: { label: string; color: string; key: SeriesKey; shape: 'line' | 'dashed' | 'area' | 'dot' }[] = [
-    { label: t('legendLabels.inferred'), color: C_INFERRED, key: 'tf_mean',  shape: 'line'   },
-    { label: t('legendLabels.ci'),       color: C_INFERRED, key: 'ci_band',  shape: 'area'   },
-    { label: t('legendLabels.true'),     color: C_TRUE,     key: 'tf_true',  shape: 'dashed' },
-    { label: t('legendLabels.rtd'),      color: C_NOISE,    key: 'noisy_tc', shape: 'dot'    },
-  ]
-
-  return (
-    <div className="flex flex-wrap justify-center gap-x-6 gap-y-2 pt-3 pb-1 px-2">
-      {items.map(({ label, color, key, shape }) => {
-        const dimmed = hoveredLine !== null && hoveredLine !== key
-        return (
-          <button
-            key={key}
-            type="button"
-            className="flex items-center gap-1.5 text-xs rounded px-1.5 py-0.5 transition-opacity
-              hover:bg-slate-800 focus:outline-none cursor-default select-none"
-            style={{ opacity: dimmed ? 0.35 : 1 }}
-            onMouseEnter={() => onHover(key)}
-            onMouseLeave={() => onHover(null)}
-          >
-            {shape === 'area' ? (
-              <span
-                className="inline-block w-8 h-3.5 rounded-sm shrink-0"
-                style={{ background: C_CI_FILL, border: `1px solid ${color}` }}
-              />
-            ) : shape === 'dot' ? (
-              <span
-                className="inline-block w-2.5 h-2.5 rounded-full shrink-0"
-                style={{ background: color }}
-              />
-            ) : (
-              <svg width="28" height="10" className="shrink-0" aria-hidden>
-                <line
-                  x1="0" y1="5" x2="28" y2="5"
-                  stroke={color}
-                  strokeWidth="2"
-                  strokeDasharray={shape === 'dashed' ? '5 3' : undefined}
-                />
-              </svg>
-            )}
-            <span style={{ color }}>{label}</span>
-          </button>
-        )
-      })}
-    </div>
-  )
-}
-
-// ── Domain helpers ────────────────────────────────────────────────────────────
-
-function fuelDomain(rows: ChartRow[]): [number, number] {
-  if (rows.length === 0) return [600, 700]
-  const lows  = rows.flatMap((r) => [r.ci_lower, r.tf_true]).filter(isFinite)
-  const highs = rows.flatMap((r) => [r.ci_upper, r.tf_true]).filter(isFinite)
-  if (lows.length === 0 || highs.length === 0) return [600, 700]
-  const pad = 0.5
-  return [Math.floor(Math.min(...lows) - pad), Math.ceil(Math.max(...highs) + pad)]
-}
-
-function coolDomain(rows: ChartRow[]): [number, number] {
-  if (rows.length === 0) return [310, 340]
-  const vals = rows.map((r) => r.noisy_tc).filter(isFinite)
-  if (vals.length === 0) return [310, 340]
-  const pad = 0.5
-  return [Math.floor(Math.min(...vals) - pad), Math.ceil(Math.max(...vals) + pad)]
-}
-
-// ── Opacity helper ────────────────────────────────────────────────────────────
-
-function seriesOpacity(key: SeriesKey, hovered: SeriesKey | null): number {
-  if (!hovered || hovered === key) return 1
-  return 0.15
-}
-
-// ── Main export ───────────────────────────────────────────────────────────────
+// ── Props ─────────────────────────────────────────────────────────────────────
 
 interface Props {
   data:          SensorResultPoint[]
@@ -229,198 +423,51 @@ interface Props {
   nominalCoolC:  number
 }
 
+// ── Main export ───────────────────────────────────────────────────────────────
+
 export const VirtualSensorChart = React.forwardRef<HTMLDivElement, Props>(
   function VirtualSensorChart({ data, nominalFuelC, nominalCoolC }, ref) {
     const { t } = useTranslation()
-    const [hoveredLine, setHoveredLine] = useState<SeriesKey | null>(null)
 
-    const rows    = useMemo(() => toChartRows(data), [data])
-    const fDomain = useMemo(() => fuelDomain(rows), [rows])
-    const cDomain = useMemo(() => coolDomain(rows), [rows])
+    const sa = useMemo(() => buildSeriesArrays(data), [data])
 
-    // Dynamic width: minimum 3 000 px, then 4 px per data point
-    const chartWidth = Math.max(3_000, rows.length * 4)
+    const option = useMemo(
+      () =>
+        buildOption(
+          sa,
+          nominalFuelC,
+          nominalCoolC,
+          t('legendLabels.inferred'),
+          t('legendLabels.ci'),
+          t('legendLabels.true'),
+          t('legendLabels.rtd'),
+          t('chart.timeAxis'),
+          t('chart.fuelAxis'),
+          t('chart.coolAxis'),
+          't',
+          t('chart.tfInferred'),
+          t('chart.tfTrue'),
+          t('chart.rtdNoisy'),
+          t('chart.instantError'),
+        ),
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [sa, nominalFuelC, nominalCoolC],
+    )
 
     return (
-      <div ref={ref} className="rounded-xl overflow-hidden" style={{ background: CHART_BG }}>
-        {/* Scrollable chart area */}
-        <div className="overflow-x-auto">
-          <div style={{ width: `${chartWidth}px` }}>
-            <ComposedChart
-              width={chartWidth}
-              height={420}
-              data={rows}
-              margin={{ top: 16, right: 72, left: 10, bottom: 28 }}
-            >
-              {/* ── Grid ──────────────────────────────────────────────────── */}
-              <CartesianGrid
-                strokeDasharray="2 4"
-                stroke={C_GRID}
-                vertical={true}
-              />
-
-              {/* ── Axes ──────────────────────────────────────────────────── */}
-              <XAxis
-                dataKey="t"
-                type="number"
-                domain={['dataMin', 'dataMax']}
-                tick={{ fontSize: 10, fill: '#94a3b8', fontFamily: 'monospace' }}
-                tickFormatter={(v: number) => isFinite(v) ? `${v.toFixed(1)}s` : ''}
-                tickLine={{ stroke: '#475569' }}
-                axisLine={{ stroke: '#475569' }}
-                label={{
-                  value: t('chart.timeAxis'),
-                  position: 'insideBottom',
-                  offset: -14,
-                  fontSize: 10,
-                  fill: '#64748b',
-                  fontFamily: 'monospace',
-                }}
-              />
-
-              {/* Left Y: T_fuel [°C] */}
-              <YAxis
-                yAxisId="fuel"
-                orientation="left"
-                domain={fDomain}
-                tick={{ fontSize: 10, fill: C_INFERRED, fontFamily: 'monospace' }}
-                tickFormatter={(v: number) => isFinite(v) ? `${v.toFixed(1)}` : ''}
-                tickLine={{ stroke: '#475569' }}
-                axisLine={{ stroke: '#475569' }}
-                width={52}
-                label={{
-                  value: t('chart.fuelAxis'),
-                  angle: -90,
-                  position: 'insideLeft',
-                  offset: 6,
-                  fontSize: 10,
-                  fill: C_INFERRED,
-                  fontFamily: 'monospace',
-                }}
-              />
-
-              {/* Right Y: T_coolant [°C] */}
-              <YAxis
-                yAxisId="cool"
-                orientation="right"
-                domain={cDomain}
-                tick={{ fontSize: 10, fill: C_NOISE, fontFamily: 'monospace' }}
-                tickFormatter={(v: number) => isFinite(v) ? `${v.toFixed(1)}` : ''}
-                tickLine={{ stroke: '#475569' }}
-                axisLine={{ stroke: '#475569' }}
-                width={56}
-                label={{
-                  value: t('chart.coolAxis'),
-                  angle: 90,
-                  position: 'insideRight',
-                  offset: 6,
-                  fontSize: 10,
-                  fill: C_NOISE,
-                  fontFamily: 'monospace',
-                }}
-              />
-
-              {/* ── Tooltip ──────────────────────────────────────────────── */}
-              <Tooltip content={<EnKFTooltip />} />
-
-              {/* ── Reference lines (nominal operating point) ────────────── */}
-              <ReferenceLine
-                yAxisId="fuel"
-                y={nominalFuelC}
-                stroke="rgba(0,229,255,0.25)"
-                strokeDasharray="8 4"
-                label={{
-                  value: 'T_f₀',
-                  position: 'left',
-                  fontSize: 9,
-                  fill: 'rgba(0,229,255,0.5)',
-                  fontFamily: 'monospace',
-                }}
-              />
-              <ReferenceLine
-                yAxisId="cool"
-                y={nominalCoolC}
-                stroke="rgba(255,234,0,0.2)"
-                strokeDasharray="8 4"
-              />
-
-              {/* ── CI BAND (95% confidence interval ±2σ) ────────────────── */}
-              <Area
-                yAxisId="fuel"
-                type="monotone"
-                dataKey="ci_upper"
-                fill={C_CI_FILL}
-                fillOpacity={seriesOpacity('ci_band', hoveredLine)}
-                stroke="none"
-                dot={false}
-                activeDot={false}
-                legendType="none"
-                isAnimationActive={false}
-              />
-              {/* Mask area — keep full opacity (background fill trick) */}
-              <Area
-                yAxisId="fuel"
-                type="monotone"
-                dataKey="ci_lower"
-                fill={CHART_BG}
-                fillOpacity={1}
-                stroke="none"
-                dot={false}
-                activeDot={false}
-                legendType="none"
-                isAnimationActive={false}
-              />
-
-              {/* ── Ground truth T_fuel (dashed coral) ───────────────────── */}
-              <Line
-                yAxisId="fuel"
-                type="monotone"
-                dataKey="tf_true"
-                stroke={C_TRUE}
-                strokeWidth={1.5}
-                strokeDasharray="5 3"
-                strokeOpacity={seriesOpacity('tf_true', hoveredLine)}
-                dot={false}
-                activeDot={{ r: 3, strokeWidth: 0, fill: C_TRUE }}
-                legendType="none"
-                isAnimationActive={false}
-              />
-
-              {/* ── EnKF posterior mean T_fuel (solid electric cyan) ──────── */}
-              <Line
-                yAxisId="fuel"
-                type="monotone"
-                dataKey="tf_mean"
-                stroke={C_INFERRED}
-                strokeWidth={2.5}
-                strokeOpacity={seriesOpacity('tf_mean', hoveredLine)}
-                dot={false}
-                activeDot={{ r: 4, strokeWidth: 0, fill: C_INFERRED }}
-                legendType="none"
-                isAnimationActive={false}
-              />
-
-              {/* ── Noisy RTD coolant readings (neon yellow scatter dots) ─── */}
-              <Line
-                yAxisId="cool"
-                type="monotone"
-                dataKey="noisy_tc"
-                stroke="none"
-                strokeWidth={0}
-                strokeOpacity={seriesOpacity('noisy_tc', hoveredLine)}
-                dot={{ r: 1.8, fill: C_NOISE, strokeWidth: 0,
-                       fillOpacity: seriesOpacity('noisy_tc', hoveredLine) }}
-                activeDot={{ r: 3.5, fill: C_NOISE, strokeWidth: 0 }}
-                legendType="none"
-                isAnimationActive={false}
-                connectNulls={false}
-              />
-            </ComposedChart>
-          </div>
-        </div>
-
-        {/* Interactive legend — outside scroll area, always visible */}
-        <EnKFLegend hoveredLine={hoveredLine} onHover={setHoveredLine} />
+      <div
+        ref={ref}
+        className="rounded-xl overflow-hidden"
+        style={{ background: CHART_BG }}
+      >
+        <ReactECharts
+          option={option}
+          style={{ height: 480, width: '100%' }}
+          notMerge
+          lazyUpdate={false}
+          opts={{ renderer: 'canvas' }}
+          theme={undefined}
+        />
       </div>
     )
   },
