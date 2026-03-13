@@ -515,6 +515,73 @@ class EnKFSensor:
 
         return T_f_mean, T_f_var
 
+    # ─────────────────────────────────────────── zero-sync hot-path step ──
+
+    @_no_grad
+    def step_gpu(
+        self,
+        noisy_observation_T_coolant: float,
+        dt: float,
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """
+        Fast EnKF predict-update cycle — **zero CPU/GPU synchronisations**.
+
+        Performs the identical predict-update cycle as ``step_assimilation``
+        but skips all diagnostic ``.item()`` extractions and ``self.history``
+        logging.  Returns 0-dim tensors on ``self.solver.device`` so the caller
+        can accumulate them into a pre-allocated GPU buffer and perform a single
+        bulk ``.cpu()`` transfer once per I/O flush batch.
+
+        Use this method in high-throughput assimilation loops where PCIe
+        round-trip latency (WSL2/HIP ≈ 500 µs per sync) would otherwise
+        dominate the total wall-clock time.
+
+        Parameters
+        ----------
+        noisy_observation_T_coolant : float
+            Scalar RTD coolant measurement [K].
+        dt : float
+            Integration time step [s].
+
+        Returns
+        -------
+        (T_f_mean_t, T_f_var_t)
+            Both are 0-dim tensors residing on ``self.solver.device``.
+            **Do not call** ``.item()`` inside the loop — collect into a GPU
+            buffer and transfer the whole batch to CPU in one call.
+        """
+        y_obs = float(noisy_observation_T_coolant)
+        H = self._H   # (1, 9)
+        R = self._R   # (1, 1)
+
+        # (a) Forecast — RK4 for all N members in-place, fully on device
+        self.solver.step(dt)
+        X_f: torch.Tensor = self.solver._y   # (N, 9) direct view — no copy
+
+        # (b) Optional covariance inflation  +  P_f ∈ ℝ^{9×9}
+        if self.config.inflation_factor != 1.0:
+            _inflate_ensemble(X_f, self.config.inflation_factor)
+        P_f: torch.Tensor = torch.cov(X_f.T)   # (9, 9) — stays on device
+
+        # (c) Innovation covariance  S = H P_f H^T + R  [+ Tikhonov ε]
+        S: torch.Tensor = H @ P_f @ H.T + R    # (1, 1)
+        S.diagonal().add_(_S_TIKHONOV)
+
+        # (d) Kalman gain transposed  K^T = linalg.solve(S, H P_f)
+        K_T: torch.Tensor = torch.linalg.solve(S, H @ P_f)   # (1, 9)
+
+        # (e) Stochastic analysis update  X_a = X_f + d · K^T
+        self._eps.normal_()
+        self._eps.mul_(self._sqrt_R)
+        torch.add(self._eps, y_obs, out=self._d)   # _d ← y_obs + ε
+        self._d.sub_(X_f[:, _IDX_T_C])             # _d ← innovation
+        X_f.addmm_(self._d.unsqueeze(1), K_T)      # in-place: (N,9) += (N,1)@(1,9)
+
+        # Posterior T_fuel — 0-dim GPU tensors: NO .item(), NO CPU sync
+        T_f_post: torch.Tensor = X_f[:, _IDX_T_F]
+        self._t += dt
+        return T_f_post.mean(), T_f_post.var(correction=1)
+
     # ──────────────────────────────────────────────── convenience helpers ──
 
     @_no_grad

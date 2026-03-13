@@ -437,19 +437,89 @@ def run_virtual_sensor_job(
         raw_conn = engine.raw_connection()
         cursor   = raw_conn.cursor()
 
-        # ── 6. Assimilation loop + batched I/O ───────────────────────────────
-        # Row buffer: each element is a tuple matching _INSERT_VS_SQL columns:
-        #   (ts, run_id, sim_time_s, noisy_t_coolant,
-        #    inferred_t_fuel_mean, inferred_t_fuel_std, true_t_fuel)
+        # ── 6. Assimilation loop — zero-sync GPU accumulation + batched I/O ───
+        #
+        # Performance design
+        # ------------------
+        # Each call to step_assimilation() would call .item() ≈ 11 times,
+        # generating 11 CUDA synchronisations (PCIe round-trips) per step.
+        # For N=100 000 and n_steps=6 000 that is 66 000 forced syncs —
+        # the dominant cost on WSL2/HIP where one sync ≈ 500 µs overhead.
+        #
+        # sensor.step_gpu() returns 0-dim GPU tensors (no .item()).
+        # They are written into _batch_gpu (pre-allocated on the compute
+        # device) via async tensor assignment — no CPU involvement at all.
+        #
+        # When _batch_gpu fills up (or at the end of the loop), a single
+        # .cpu() call transfers the whole block in one DMA burst:
+        #
+        #   n_steps=6 000, insert_batch_size=10 000 → 1 bulk transfer total
+        #   n_steps=60 000, insert_batch_size=10 000 → 6 bulk transfers total
+        #   vs. step_assimilation(): 66 000 individual sync round-trips
+        #
+        # CPU-side numpy extractions (times_np, noisy_tc_np, true_tf_np)
+        # are already in RAM and do not touch the GPU bus.
+
+        # Pre-allocate GPU batch buffer — reused every flush cycle.
+        # Col 0: T_f_mean,  Col 1: T_f_var  (both posterior, float32)
+        _batch_gpu = _torch.empty(
+            insert_batch_size, 2,
+            dtype=solver.dtype, device=effective_device,
+        )
+        # CPU-side metadata for the current batch: (sim_time_s, noisy_tc, true_tf)
+        # These are Python floats extracted from numpy arrays — no GPU involvement.
+        _batch_meta: list[tuple[float, float, float]] = []
+        _buf_pos: int = 0
+
         row_buffer: list[tuple[object, ...]] = []
         run_uuid   = uuid.UUID(run_id)
-        sq_errors: list[float] = []      # for RMSE computation
-        spreads:   list[float] = []      # for Spread-Skill ratio
+        sq_errors: list[float] = []      # squared errors for RMSE
+        spreads:   list[float] = []      # ensemble std per step (Spread-Skill)
         rows_inserted = 0
 
+        def _flush_batch() -> None:
+            """
+            Transfer the GPU batch buffer to CPU in one DMA call, build the
+            DB row tuples, compute running RMSE / spread, and flush to TimescaleDB.
+
+            This is the ONLY point where a CPU↔GPU synchronisation occurs:
+            _batch_gpu[:_buf_pos].cpu() issues a single blocking copy for the
+            entire batch — one CUDA sync per insert_batch_size steps, not one
+            per step.
+            """
+            nonlocal _buf_pos, rows_inserted
+            if _buf_pos == 0:
+                return
+            # ── Single bulk D→H transfer (one CUDA sync) ─────────────────────
+            batch_cpu = _batch_gpu[:_buf_pos].cpu()   # (buf_pos, 2) — RAM
+            for j in range(_buf_pos):
+                tf_mean = float(batch_cpu[j, 0])
+                tf_var  = float(batch_cpu[j, 1])
+                tf_std  = math.sqrt(max(tf_var, 0.0))
+                sim_t, noisy_tc_j, true_tf_j = _batch_meta[j]
+                row_buffer.append((
+                    anchor + timedelta(seconds=sim_t),
+                    run_uuid,
+                    sim_t,
+                    noisy_tc_j,
+                    tf_mean,
+                    tf_std,
+                    true_tf_j,
+                ))
+                sq_errors.append((tf_mean - true_tf_j) ** 2)
+                spreads.append(tf_std)
+            rows_inserted += _flush_vs_rows(cursor, raw_conn, row_buffer)
+            row_buffer.clear()
+            _batch_meta.clear()
+            _buf_pos = 0
+            logger.debug(
+                "run_id=%s: flushed batch, total inserted=%d / %d",
+                run_id, rows_inserted, n_steps,
+            )
+
         # ── t=0: record the prior (initial ensemble) without stepping ────────
-        # The filter hasn't seen any observation yet; this captures the
-        # initial uncertainty before the first predict-update cycle.
+        # Two .item() calls here are acceptable — they occur once, outside
+        # the hot loop, and are required to persist the t=0 prior state.
         init_mean = float(solver.state_mean[7].item())
         init_std  = float(solver.state_std[7].item())
         row_buffer.append((
@@ -461,46 +531,33 @@ def run_virtual_sensor_job(
             init_std,
             float(true_tf_np[0]),
         ))
-        sq_errors.append((init_mean - true_tf_np[0]) ** 2)
+        sq_errors.append((init_mean - float(true_tf_np[0])) ** 2)
         spreads.append(init_std)
 
-        # ── t[1] … t[n_steps-1]: predict → assimilate → record ──────────────
+        # ── t[1] … t[n_steps-1]: predict → assimilate → accumulate ──────────
         for i in range(1, n_steps):
-            # GPU step: RK4 forecast + stochastic EnKF update
-            # All N members advance simultaneously in one call — no loop over N.
-            t_fuel_mean, t_fuel_var = sensor.step_assimilation(
-                noisy_observation_T_coolant=float(noisy_tc_np[i]),
-                dt=dt,
-            )
-            t_fuel_std = math.sqrt(max(t_fuel_var, 0.0))
+            # Zero CUDA syncs: step_gpu() returns 0-dim tensors on device.
+            # All N members advance via RK4 + stochastic EnKF — fully vectorised.
+            tf_mean_t, tf_var_t = sensor.step_gpu(float(noisy_tc_np[i]), dt)
 
-            row_buffer.append((
-                anchor + timedelta(seconds=float(times_np[i])),
-                run_uuid,
+            # Async GPU write — queues a CUDA copy kernel, no CPU stall.
+            _batch_gpu[_buf_pos, 0] = tf_mean_t
+            _batch_gpu[_buf_pos, 1] = tf_var_t
+
+            # CPU-only metadata: numpy → Python float, no GPU bus traffic.
+            _batch_meta.append((
                 float(times_np[i]),
                 float(noisy_tc_np[i]),
-                t_fuel_mean,
-                t_fuel_std,
                 float(true_tf_np[i]),
             ))
-            sq_errors.append((t_fuel_mean - true_tf_np[i]) ** 2)
-            spreads.append(t_fuel_std)
+            _buf_pos += 1
 
-            # Flush to TimescaleDB when the buffer is full.
-            # execute_values sends one large VALUES clause per call —
-            # one psycopg2 round-trip covers insert_batch_size rows.
-            if len(row_buffer) >= insert_batch_size:
-                rows_inserted += _flush_vs_rows(cursor, raw_conn, row_buffer)
-                row_buffer.clear()
-                logger.debug(
-                    "run_id=%s: flushed batch, total inserted=%d / %d",
-                    run_id, rows_inserted, n_steps,
-                )
+            # Flush when the GPU buffer is full (one bulk D→H transfer).
+            if _buf_pos >= insert_batch_size:
+                _flush_batch()
 
         # ── Final flush of any remaining rows ────────────────────────────────
-        if row_buffer:
-            rows_inserted += _flush_vs_rows(cursor, raw_conn, row_buffer)
-            row_buffer.clear()
+        _flush_batch()
 
         cursor.close()
         raw_conn.close()
