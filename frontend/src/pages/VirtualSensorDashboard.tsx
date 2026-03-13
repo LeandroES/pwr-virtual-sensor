@@ -717,7 +717,7 @@ export function VirtualSensorDashboard() {
   const [activeJobId, setActiveJobId]       = useState<string | null>(null)
   const [lastNoiseSigma, setLastNoiseSigma] = useState(FORM_DEFAULTS.obs_noise_std_K)
   const [isExporting, setIsExporting]       = useState(false)
-  const exportRef                           = useRef<HTMLDivElement>(null)
+  const chartRef                            = useRef<HTMLDivElement>(null)
   const queryClient                         = useQueryClient()
 
   // ── POST /sensor/simulate ───────────────────────────────────────────────
@@ -747,7 +747,7 @@ export function VirtualSensorDashboard() {
   // ── GET /sensor/{id}/results (fires once on completion) ────────────────
   const { data: resultsData, isLoading: resultsLoading } = useQuery({
     queryKey: ['sensorResults', activeJobId],
-    queryFn: () => getSensorResults(activeJobId!, 3_000),
+    queryFn: () => getSensorResults(activeJobId!),
     enabled: activeJobId !== null && currentStatus === 'completed',
     staleTime: Infinity,
     retry: 2,
@@ -790,45 +790,169 @@ export function VirtualSensorDashboard() {
     [submitMutation],
   )
 
-  // ── PDF export ──────────────────────────────────────────────────────────
+  // ── PDF export — structured report ─────────────────────────────────────
   const handleExportPdf = useCallback(async () => {
-    if (!exportRef.current || !activeJobId || isExporting) return
+    if (!activeJobId || isExporting) return
     setIsExporting(true)
 
     try {
-      const canvas = await html2canvas(exportRef.current, {
-        scale: 2,
-        backgroundColor: '#020617',
-        useCORS: true,
-        logging: false,
+      const pdf  = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' })
+      const W      = 210
+      const MARGIN = 14
+      const CW     = W - MARGIN * 2   // content width
+      let y        = MARGIN
+
+      // ── Background ────────────────────────────────────────────────────────
+      pdf.setFillColor(15, 23, 42)    // slate-950
+      pdf.rect(0, 0, W, 297, 'F')
+
+      // ── Title ─────────────────────────────────────────────────────────────
+      pdf.setFont('helvetica', 'bold')
+      pdf.setFontSize(16)
+      pdf.setTextColor(226, 232, 240)  // slate-200
+      pdf.text('PWR Virtual Sensor — Informe de Análisis EnKF', MARGIN, y + 6)
+      y += 10
+
+      pdf.setFont('helvetica', 'normal')
+      pdf.setFontSize(9)
+      pdf.setTextColor(100, 116, 139)  // slate-500
+      pdf.text(
+        'Sensor Virtual de Temperatura de Combustible  |  Filtro de Kalman por Ensamble',
+        MARGIN, y + 4,
+      )
+      y += 10
+
+      // Divider
+      pdf.setDrawColor(51, 65, 85)    // slate-700
+      pdf.setLineWidth(0.3)
+      pdf.line(MARGIN, y, W - MARGIN, y)
+      y += 7
+
+      // ── Job metadata ──────────────────────────────────────────────────────
+      const createdAt = statusData?.created_at
+        ? new Date(statusData.created_at).toLocaleString()
+        : '—'
+
+      const metaRows: [string, string][] = [
+        ['Fecha de análisis', createdAt],
+        ['Job ID',            activeJobId],
+        ['Estado',            currentStatus ?? '—'],
+        ['Dispositivo',       deviceUsed ?? '—'],
+        ['Tiempo de ejecución',
+          executionTime != null ? `${executionTime.toFixed(2)} s` : '—'],
+      ]
+
+      pdf.setFontSize(9)
+      metaRows.forEach(([label, value]) => {
+        pdf.setFont('helvetica', 'bold')
+        pdf.setTextColor(148, 163, 184)  // slate-400
+        pdf.text(`${label}:`, MARGIN, y)
+        pdf.setFont('helvetica', 'normal')
+        pdf.setTextColor(226, 232, 240)
+        pdf.text(value, MARGIN + 54, y)
+        y += 6
       })
 
-      const imgData = canvas.toDataURL('image/png')
-      const A4_W = 210
-      const A4_H = 297
+      y += 3
+      pdf.setDrawColor(51, 65, 85)
+      pdf.line(MARGIN, y, W - MARGIN, y)
+      y += 8
 
-      const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' })
+      // ── Metrics table ─────────────────────────────────────────────────────
+      if (metrics) {
+        pdf.setFont('helvetica', 'bold')
+        pdf.setFontSize(10)
+        pdf.setTextColor(0, 229, 255)    // electric cyan
+        pdf.text('MÉTRICAS DEL FILTRO EnKF', MARGIN, y)
+        y += 6
 
-      const imgW = A4_W
-      const imgH = (canvas.height / canvas.width) * A4_W
+        const tableRows: [string, string][] = [
+          ['RMSE (T_fuel)',
+            metrics.rmse_K != null ? `${metrics.rmse_K.toFixed(4)} K` : '—'],
+          ['MAE (T_fuel)',
+            metrics.mae_K != null ? `${metrics.mae_K.toFixed(4)} K` : '—'],
+          ['Cobertura 68 %',
+            metrics.coverage_68pct != null ? `${metrics.coverage_68pct.toFixed(2)} %` : '—'],
+          ['Cobertura 95 %',
+            metrics.coverage_95pct != null ? `${metrics.coverage_95pct.toFixed(2)} %` : '—'],
+          ['σ media ensemble',
+            metrics.mean_ensemble_std_K != null
+              ? `${metrics.mean_ensemble_std_K.toFixed(4)} K` : '—'],
+          ['Puntos totales', metrics.total_points.toLocaleString()],
+        ]
 
-      let pageTop = 0
-      let remaining = imgH
-      let page = 0
+        const ROW_H = 8
+        tableRows.forEach(([label, value], i) => {
+          const rowY = y + i * ROW_H
+          pdf.setFillColor(i % 2 === 0 ? 30 : 15, i % 2 === 0 ? 41 : 23, i % 2 === 0 ? 59 : 42)
+          pdf.rect(MARGIN, rowY - 5, CW, ROW_H, 'F')
+          pdf.setFont('helvetica', 'normal')
+          pdf.setFontSize(9)
+          pdf.setTextColor(148, 163, 184)
+          pdf.text(label, MARGIN + 2, rowY)
+          pdf.setFont('helvetica', 'bold')
+          pdf.setTextColor(226, 232, 240)
+          pdf.text(value, MARGIN + CW * 0.6, rowY)
+        })
 
-      while (remaining > 0) {
-        if (page > 0) pdf.addPage()
-        pdf.addImage(imgData, 'PNG', 0, -pageTop, imgW, imgH)
-        pageTop  += A4_H
-        remaining -= A4_H
-        page++
+        y += tableRows.length * ROW_H + 10
       }
 
-      pdf.save(`Analisis_SensorVirtual_${activeJobId}.pdf`)
+      // ── Chart image ───────────────────────────────────────────────────────
+      if (chartRef.current) {
+        pdf.setFont('helvetica', 'bold')
+        pdf.setFontSize(10)
+        pdf.setTextColor(0, 229, 255)
+        pdf.text('RESPUESTA TRANSITORIA', MARGIN, y)
+        y += 6
+
+        // Capture only the visible viewport of the chart container
+        const el = chartRef.current
+        const canvas = await html2canvas(el, {
+          scale: 1.5,
+          backgroundColor: '#0f172a',
+          useCORS: true,
+          logging: false,
+          width:  el.offsetWidth,
+          height: el.offsetHeight,
+        })
+
+        const imgData  = canvas.toDataURL('image/png')
+        const imgW     = CW
+        const imgH     = (canvas.height / canvas.width) * imgW
+        const spaceLeft = 297 - y - MARGIN
+
+        if (imgH > spaceLeft) {
+          pdf.addPage()
+          pdf.setFillColor(15, 23, 42)
+          pdf.rect(0, 0, W, 297, 'F')
+          y = MARGIN
+        }
+
+        pdf.addImage(imgData, 'PNG', MARGIN, y, imgW, Math.min(imgH, 297 - y - MARGIN))
+      }
+
+      // ── Footer on every page ──────────────────────────────────────────────
+      const totalPages = pdf.getNumberOfPages()
+      for (let p = 1; p <= totalPages; p++) {
+        pdf.setPage(p)
+        pdf.setFont('helvetica', 'normal')
+        pdf.setFontSize(7)
+        pdf.setTextColor(71, 85, 105)    // slate-600
+        pdf.text(
+          `PWR Virtual Sensor — EnKF Data Assimilation  |  Pág. ${p} de ${totalPages}`,
+          MARGIN, 293,
+        )
+      }
+
+      pdf.save(`VSensor_Informe_${activeJobId.slice(0, 8)}.pdf`)
     } finally {
       setIsExporting(false)
     }
-  }, [activeJobId, isExporting])
+  }, [
+    activeJobId, isExporting, metrics,
+    statusData, currentStatus, deviceUsed, executionTime,
+  ])
 
   const ledStatus: RunStatus | 'idle' = currentStatus ?? 'idle'
   const hasResults = currentStatus === 'completed' && (metrics !== null || chartData.length > 0)
@@ -930,8 +1054,7 @@ export function VirtualSensorDashboard() {
         </aside>
 
         {/* ── Main scrollable content ─────────────────────────────────── */}
-        <div className="flex-1 overflow-y-auto">
-          <div ref={exportRef} style={{ background: '#020617' }}>
+        <div className="flex-1 overflow-y-auto" style={{ background: '#020617' }}>
             <main className="max-w-5xl mx-auto w-full px-4 sm:px-6 py-6 space-y-5">
 
               {/* ── Parameter configuration ─────────────────────────── */}
@@ -1068,6 +1191,7 @@ export function VirtualSensorDashboard() {
                   </div>
 
                   <VirtualSensorChart
+                    ref={chartRef}
                     data={chartData}
                     nominalFuelC={NOM_FUEL_C}
                     nominalCoolC={NOM_COOL_C}
@@ -1196,7 +1320,6 @@ export function VirtualSensorDashboard() {
                 </div>
               )}
             </main>
-          </div>
         </div>
       </div>
 

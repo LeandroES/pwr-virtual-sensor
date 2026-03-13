@@ -29,7 +29,7 @@ export async function getSensorStatus(jobId: string): Promise<SensorJobStatus> {
  */
 export async function getSensorResults(
   jobId: string,
-  maxPoints = 3_000,
+  maxPoints = 50_000,
 ): Promise<SensorResultsResponse> {
   const { data } = await client.get<SensorResultsResponse>(
     `/sensor/${jobId}/results`,
