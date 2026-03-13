@@ -393,3 +393,28 @@ class SensorJobStatus(BaseModel):
             "Null while the job is pending."
         ),
     )
+
+
+# ── GET /sensor/runs/history ──────────────────────────────────────────────────
+
+
+class SensorHistoryItem(BaseModel):
+    """One entry in the simulation history list."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    run_id: uuid.UUID
+    created_at: datetime
+    status: str
+    device_used: str | None = None
+    execution_time_s: float | None = Field(
+        default=None,
+        description="Wall-clock duration of the EnKF simulation phase [s].",
+    )
+    rmse_K: float | None = Field(
+        default=None,
+        description=(
+            "Root-mean-square error between inferred T_fuel and ground truth [K].  "
+            "Null for runs that have not yet produced telemetry."
+        ),
+    )

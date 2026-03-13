@@ -321,15 +321,17 @@ def run_virtual_sensor_job(
     # See docs/overhead_analysis.md for the full justification.
     import torch as _torch
 
-    if ensemble_size < _GPU_ENSEMBLE_THRESHOLD:
+    if ensemble_size <= 10_000:
         effective_device: str = "cpu"
         device_reason: str = (
-            "Tamaño de ensamble óptimo para CPU. "
-            "Previene overhead de transferencia PCIe."
+            "Tamaño de ensamble ≤ 10 000: CPU más rápido "
+            "por overhead PCIe/HIP mínimo a este tamaño."
         )
     else:
         effective_device = "cuda"
-        device_reason = "Tamaño masivo. Aceleración GPU habilitada."
+        device_reason = (
+            "Tamaño de ensamble > 10 000: aceleración GPU habilitada."
+        )
 
     # Hardware availability override: if GPU was selected but is not present,
     # fall back to CPU and append a diagnostic note to the reason string.

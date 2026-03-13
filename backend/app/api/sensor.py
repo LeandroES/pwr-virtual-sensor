@@ -54,6 +54,7 @@ from app.models.run import Run
 from app.models.telemetry import VirtualSensorTelemetry
 from app.schemas.sensor import (
     MAX_POINTS_LIMIT,
+    SensorHistoryItem,
     SensorJobStatus,
     SensorMetrics,
     SensorResultPoint,
@@ -405,3 +406,64 @@ def get_sensor_results(
         device_used=run.device_used,
         device_reason=run.device_reason,
     )
+
+
+# ── GET /sensor/runs/history ──────────────────────────────────────────────────
+
+
+@router.get(
+    "/runs/history",
+    response_model=list[SensorHistoryItem],
+    summary="List all virtual-sensor simulations ordered by creation date",
+)
+def get_sensor_history(db: DbSession) -> list[SensorHistoryItem]:
+    """
+    Return every simulation run ordered by ``created_at`` descending.
+
+    The ``rmse_K`` field is computed on-the-fly via a LEFT JOIN aggregate
+    over ``virtual_sensor_telemetry``.  Runs that have not yet produced
+    telemetry (pending, running, or failed with 0 rows) return ``rmse_K=None``.
+    """
+    rmse_subq = (
+        select(
+            VirtualSensorTelemetry.run_id,
+            func.sqrt(
+                func.avg(
+                    func.power(
+                        VirtualSensorTelemetry.inferred_t_fuel_mean
+                        - VirtualSensorTelemetry.true_t_fuel,
+                        2,
+                    )
+                )
+            ).label("rmse_K"),
+        )
+        .group_by(VirtualSensorTelemetry.run_id)
+        .subquery()
+    )
+
+    stmt = (
+        select(
+            Run.id,
+            Run.created_at,
+            Run.status,
+            Run.device_used,
+            Run.execution_time,
+            rmse_subq.c.rmse_K,
+        )
+        .outerjoin(rmse_subq, Run.id == rmse_subq.c.run_id)
+        .order_by(Run.created_at.desc())
+    )
+
+    rows = db.execute(stmt).all()
+
+    return [
+        SensorHistoryItem(
+            run_id=row.id,
+            created_at=row.created_at,
+            status=row.status,
+            device_used=row.device_used,
+            execution_time_s=row.execution_time,
+            rmse_K=row.rmse_K,
+        )
+        for row in rows
+    ]
