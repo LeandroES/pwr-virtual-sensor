@@ -73,6 +73,17 @@ export interface SensorResultsResponse {
   device_reason: string | null
 }
 
+// ── Virtual Sensor history ─────────────────────────────────────────────────────
+
+export interface SensorHistoryItem {
+  run_id: string
+  created_at: string
+  status: RunStatus
+  device_used: string | null
+  execution_time_s: number | null
+  rmse_K: number | null
+}
+
 // ── Request payloads ──────────────────────────────────────────────────────────
 
 export interface RunCreate {

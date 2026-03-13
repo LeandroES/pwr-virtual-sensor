@@ -1,25 +1,44 @@
 /**
  * VirtualSensorDashboard — Industrial HMI panel for the EnKF virtual sensor.
  *
+ * Layout:
+ *   Header (full width)
+ *   ├── Sidebar 288px  — analysis history, fetched from GET /sensor/runs/history
+ *   └── Main content   — parameter form + results panel
+ *   Footer (full width)
+ *
  * Design principles:
- *   - Dark slate theme (slate-950/900/800) — nuclear control room aesthetic.
+ *   - Dark slate theme (slate-950/900/800).
  *   - Cyan accents for EnKF inference. Amber for sensor noise. Red for truth.
  *   - Monospaced numerics for all physical values.
  *   - LED-style status indicators with pulse animation.
  *   - ISO-inspired KPI tiles: RMSE, MAE, coverage 68/95%, mean sigma.
  *   - Zero emojis. SVG icons only.
+ *   - High-contrast text: slate-200/300 minimum for readable content.
  *
  * State machine:
  *   idle -> submitting -> polling (status) -> fetching results -> displaying
+ *   history click -> status poll (confirms completed) -> fetch results -> displaying
  */
-import { useState, useCallback, useMemo, useRef } from 'react'
+import { useState, useCallback, useMemo, useRef, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import html2canvas from 'html2canvas'
 import jsPDF from 'jspdf'
 import { VirtualSensorChart } from '../components/VirtualSensorChart'
-import { submitSensorJob, getSensorStatus, getSensorResults } from '../api/sensor'
-import type { SensorSimulateRequest, SensorMetrics, SensorResultsResponse, RunStatus } from '../types'
+import {
+  submitSensorJob,
+  getSensorStatus,
+  getSensorResults,
+  getSensorHistory,
+} from '../api/sensor'
+import type {
+  SensorSimulateRequest,
+  SensorMetrics,
+  SensorResultsResponse,
+  SensorHistoryItem,
+  RunStatus,
+} from '../types'
 import { LANGUAGES, type LangCode } from '../i18n'
 import i18n from '../i18n'
 
@@ -117,6 +136,24 @@ function IconGlobe({ className = 'w-4 h-4' }: { className?: string }) {
   )
 }
 
+function IconClock({ className = 'w-4 h-4' }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+      <circle cx="12" cy="12" r="10" strokeWidth="1.5" />
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 6v6l4 2" />
+    </svg>
+  )
+}
+
+function IconHistory({ className = 'w-4 h-4' }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+        d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+    </svg>
+  )
+}
+
 // ── Language selector ─────────────────────────────────────────────────────────
 
 function LanguageSelector() {
@@ -135,9 +172,9 @@ function LanguageSelector() {
         value={current}
         onChange={handleChange}
         className="bg-slate-900 border border-slate-700 rounded-md px-2 py-1
-          text-[10px] font-mono text-slate-400 focus:outline-none focus:ring-1
+          text-[10px] font-mono text-slate-300 focus:outline-none focus:ring-1
           focus:ring-cyan-500 focus:border-cyan-500 transition cursor-pointer
-          hover:border-slate-600 hover:text-slate-300"
+          hover:border-slate-600 hover:text-slate-200"
         aria-label="Select language"
       >
         {LANGUAGES.map((l) => (
@@ -152,11 +189,11 @@ function LanguageSelector() {
 
 function Led({ status }: { status: RunStatus | 'idle' }) {
   const cfg = {
-    idle:      { bg: 'bg-slate-600',   ring: '',                  pulse: false },
-    pending:   { bg: 'bg-amber-400',   ring: 'ring-amber-400/30', pulse: true  },
-    running:   { bg: 'bg-cyan-400',    ring: 'ring-cyan-400/30',  pulse: true  },
+    idle:      { bg: 'bg-slate-600',   ring: '',                    pulse: false },
+    pending:   { bg: 'bg-amber-400',   ring: 'ring-amber-400/30',   pulse: true  },
+    running:   { bg: 'bg-cyan-400',    ring: 'ring-cyan-400/30',    pulse: true  },
     completed: { bg: 'bg-emerald-400', ring: 'ring-emerald-400/25', pulse: false },
-    failed:    { bg: 'bg-red-500',     ring: 'ring-red-500/30',   pulse: false },
+    failed:    { bg: 'bg-red-500',     ring: 'ring-red-500/30',     pulse: false },
   }[status]
 
   return (
@@ -186,9 +223,9 @@ function MetricTile({ label, value, sub, accent = 'text-cyan-300', grade }: Metr
                   :                    'border-slate-700'
   return (
     <div className={`bg-slate-900 border ${gradeRing} rounded-xl p-4 flex flex-col gap-1`}>
-      <p className="text-[10px] font-semibold tracking-widest text-slate-500 uppercase">{label}</p>
+      <p className="text-[10px] font-semibold tracking-widest text-slate-400 uppercase">{label}</p>
       <p className={`text-2xl font-bold font-mono tabular-nums leading-tight ${accent}`}>{value}</p>
-      {sub && <p className="text-[10px] text-slate-600 font-mono">{sub}</p>}
+      {sub && <p className="text-[10px] text-slate-400 font-mono">{sub}</p>}
     </div>
   )
 }
@@ -226,8 +263,8 @@ function SensorForm({ onSubmit, disabled }: FormProps) {
   function field(label: string, unit: string, children: React.ReactNode) {
     return (
       <label className="flex flex-col gap-1.5">
-        <span className="text-[10px] font-semibold tracking-widest text-slate-500 uppercase">
-          {label}{unit && <span className="text-slate-600 normal-case font-mono"> [{unit}]</span>}
+        <span className="text-[10px] font-semibold tracking-widest text-slate-400 uppercase">
+          {label}{unit && <span className="text-slate-500 normal-case font-mono"> [{unit}]</span>}
         </span>
         {children}
       </label>
@@ -298,12 +335,12 @@ function SensorForm({ onSubmit, disabled }: FormProps) {
         )}
       </div>
 
-      <div className="flex items-center gap-3 bg-slate-800/60 border border-slate-700 rounded-lg px-4 py-2.5 text-xs font-mono text-slate-400">
+      <div className="flex items-center gap-3 bg-slate-800/60 border border-slate-700 rounded-lg px-4 py-2.5 text-xs font-mono text-slate-300">
         <span className="shrink-0 text-amber-400 font-semibold">{t('form.noiseLabel')}</span>
         <span>σ_RTD = {state.obs_noise_std_K.toFixed(1)} K</span>
-        <span className="text-slate-600">→</span>
+        <span className="text-slate-500">→</span>
         <span>R = σ² = {(state.obs_noise_std_K ** 2).toFixed(2)} K²</span>
-        <span className="text-slate-600 ml-auto">
+        <span className="text-slate-500 ml-auto">
           ~{Math.round(state.time_span_end / (parseFloat(state.dt_ms) / 1000)).toLocaleString()} {t('form.steps')}
           · N = {state.ensemble_size.toLocaleString()} {t('form.members')}
         </span>
@@ -381,7 +418,7 @@ function MetricsStrip({ m, obsSigma }: { m: SensorMetrics; obsSigma: number }) {
         label={t('metrics.meanStd')}
         value={`${fmt(m.mean_ensemble_std_K, 3)} K`}
         sub={t('metrics.posteriorSpread')}
-        accent="text-slate-300"
+        accent="text-slate-200"
       />
     </div>
   )
@@ -405,7 +442,7 @@ function ExecutionPanel({ executionTime, deviceUsed, deviceReason }: ExecutionPa
     <section>
       <div className="flex items-center gap-2 mb-3">
         <div className="w-1 h-4 rounded-full bg-violet-500" />
-        <h2 className="text-[10px] font-bold tracking-widest text-slate-500 uppercase font-mono">
+        <h2 className="text-[10px] font-bold tracking-widest text-slate-400 uppercase font-mono">
           {t('sections.computeEngine')}
         </h2>
       </div>
@@ -420,7 +457,7 @@ function ExecutionPanel({ executionTime, deviceUsed, deviceReason }: ExecutionPa
         />
 
         <div className="bg-slate-900 border border-slate-700 rounded-xl p-4 flex flex-col gap-2">
-          <p className="text-[10px] font-semibold tracking-widest text-slate-500 uppercase">
+          <p className="text-[10px] font-semibold tracking-widest text-slate-400 uppercase">
             {t('execution.selectedEngine')}
           </p>
           <div className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-md w-fit
@@ -433,16 +470,16 @@ function ExecutionPanel({ executionTime, deviceUsed, deviceReason }: ExecutionPa
             {isGpu ? <IconGpu /> : <IconCpu />}
             {isGpu ? t('execution.gpu') : t('execution.cpu')}
           </div>
-          <p className="text-[10px] text-slate-600 font-mono mt-1">
+          <p className="text-[10px] text-slate-400 font-mono mt-1">
             {isGpu ? t('execution.gpuDesc') : t('execution.cpuDesc')}
           </p>
         </div>
 
         <div className="bg-slate-900 border border-slate-700 rounded-xl p-4 flex flex-col gap-2">
-          <p className="text-[10px] font-semibold tracking-widest text-slate-500 uppercase">
+          <p className="text-[10px] font-semibold tracking-widest text-slate-400 uppercase">
             {t('execution.selectionReason')}
           </p>
-          <p className="text-xs text-slate-300 font-mono leading-relaxed">
+          <p className="text-xs text-slate-200 font-mono leading-relaxed">
             {deviceReason ?? '—'}
           </p>
         </div>
@@ -465,13 +502,209 @@ function RunningBanner({ jobId }: { jobId: string }) {
       </div>
       <div className="flex-1 min-w-0">
         <p className="text-sm font-semibold text-cyan-300">{t('running.title')}</p>
-        <p className="text-xs text-slate-500 font-mono truncate">{jobId}</p>
+        <p className="text-xs text-slate-400 font-mono truncate">{jobId}</p>
       </div>
       <div className="text-right shrink-0">
-        <p className="text-xs text-slate-400">{t('running.subtitle')}</p>
-        <p className="text-[10px] text-slate-600 font-mono mt-0.5">
+        <p className="text-xs text-slate-300">{t('running.subtitle')}</p>
+        <p className="text-[10px] text-slate-500 font-mono mt-0.5">
           {t('running.polling', { sec: POLL_MS / 1000 })}
         </p>
+      </div>
+    </div>
+  )
+}
+
+// ── Analysis date/time banner ─────────────────────────────────────────────────
+
+interface AnalysisDateBannerProps {
+  createdAt: string
+  jobId:     string
+}
+
+function AnalysisDateBanner({ createdAt, jobId }: AnalysisDateBannerProps) {
+  const date = new Date(createdAt)
+  const dateStr = date.toLocaleDateString(undefined, {
+    year: 'numeric', month: 'short', day: 'numeric',
+  })
+  const timeStr = date.toLocaleTimeString(undefined, {
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  })
+
+  return (
+    <div className="flex items-center gap-3 bg-slate-900 border border-slate-800 rounded-xl px-4 py-3">
+      <IconClock className="w-4 h-4 text-slate-500 shrink-0" />
+      <div className="flex items-baseline gap-3 flex-wrap">
+        <span className="text-[10px] font-bold tracking-widest text-slate-400 uppercase font-mono">
+          Analysis Date
+        </span>
+        <span className="text-sm font-mono font-semibold text-slate-100">
+          {dateStr}
+        </span>
+        <span className="text-sm font-mono text-slate-300">
+          {timeStr}
+        </span>
+      </div>
+      <span className="ml-auto text-[10px] font-mono text-slate-600 hidden sm:block truncate max-w-[200px]">
+        {jobId}
+      </span>
+    </div>
+  )
+}
+
+// ── History sidebar card ──────────────────────────────────────────────────────
+
+interface HistoryCardProps {
+  item:     SensorHistoryItem
+  isActive: boolean
+  onClick:  () => void
+}
+
+const STATUS_TEXT: Record<RunStatus, string> = {
+  completed: 'COMPLETED',
+  running:   'RUNNING',
+  pending:   'PENDING',
+  failed:    'FAILED',
+}
+
+const STATUS_COLOR: Record<RunStatus, string> = {
+  completed: 'text-emerald-400',
+  running:   'text-cyan-400',
+  pending:   'text-amber-400',
+  failed:    'text-red-400',
+}
+
+const STATUS_BAR: Record<RunStatus, string> = {
+  completed: 'border-l-emerald-600',
+  running:   'border-l-cyan-600',
+  pending:   'border-l-amber-600',
+  failed:    'border-l-red-700',
+}
+
+function HistoryCard({ item, isActive, onClick }: HistoryCardProps) {
+  const date   = new Date(item.created_at)
+  const dateStr = date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
+  const timeStr = date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+
+  return (
+    <button
+      onClick={onClick}
+      className={`w-full text-left px-3 py-2.5 rounded-lg border-l-2 transition-all
+        ${STATUS_BAR[item.status]}
+        ${isActive
+          ? 'bg-slate-800 border border-l-2 border-slate-600'
+          : 'bg-slate-900/40 border border-l-2 border-transparent hover:bg-slate-800/70 hover:border-slate-700/60'
+        }
+        focus:outline-none focus:ring-1 focus:ring-cyan-600/50`}
+    >
+      {/* Date row */}
+      <p className="text-[11px] font-mono text-slate-200 leading-tight">{dateStr}</p>
+      <p className="text-[10px] font-mono text-slate-500 leading-tight mt-0.5">{timeStr}</p>
+
+      {/* Status + device row */}
+      <div className="flex items-center justify-between mt-2 gap-1">
+        <span className={`text-[10px] font-bold font-mono ${STATUS_COLOR[item.status]}`}>
+          {STATUS_TEXT[item.status]}
+        </span>
+        {item.device_used && (
+          <span className="text-[10px] font-mono text-slate-500 bg-slate-800 rounded px-1.5 py-0.5">
+            {item.device_used.toUpperCase()}
+          </span>
+        )}
+      </div>
+
+      {/* RMSE */}
+      {item.rmse_K != null ? (
+        <div className="mt-1.5 flex items-center justify-between">
+          <span className="text-[10px] font-mono text-slate-500">RMSE</span>
+          <span className={`text-[11px] font-mono font-semibold tabular-nums
+            ${item.rmse_K < 1 ? 'text-emerald-400' : item.rmse_K < 3 ? 'text-amber-400' : 'text-red-400'}`}>
+            {item.rmse_K.toFixed(3)} K
+          </span>
+        </div>
+      ) : (
+        item.status !== 'completed' && (
+          <div className="mt-1.5">
+            <span className="text-[10px] font-mono text-slate-600">—</span>
+          </div>
+        )
+      )}
+
+      {/* Execution time */}
+      {item.execution_time_s != null && (
+        <div className="mt-1 flex items-center justify-between">
+          <span className="text-[10px] font-mono text-slate-600">Exec</span>
+          <span className="text-[10px] font-mono text-slate-500 tabular-nums">
+            {item.execution_time_s.toFixed(2)} s
+          </span>
+        </div>
+      )}
+    </button>
+  )
+}
+
+// ── History sidebar ───────────────────────────────────────────────────────────
+
+interface HistorySidebarProps {
+  activeJobId: string | null
+  onSelect:    (runId: string) => void
+}
+
+function HistorySidebar({ activeJobId, onSelect }: HistorySidebarProps) {
+  const { data: history, isLoading } = useQuery({
+    queryKey:       ['sensorHistory'],
+    queryFn:        getSensorHistory,
+    refetchInterval: 30_000,
+    staleTime:       10_000,
+  })
+
+  return (
+    <div className="flex flex-col h-full overflow-hidden">
+      {/* Sidebar header */}
+      <div className="px-4 py-3.5 border-b border-slate-800 shrink-0">
+        <div className="flex items-center gap-2">
+          <IconHistory className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+          <h2 className="text-[10px] font-bold tracking-widest text-slate-300 uppercase font-mono">
+            Analysis History
+          </h2>
+        </div>
+        <p className="text-[10px] text-slate-600 font-mono mt-1 pl-5">
+          {isLoading
+            ? 'Loading...'
+            : history
+              ? `${history.length} record${history.length !== 1 ? 's' : ''}`
+              : 'Unavailable'}
+        </p>
+      </div>
+
+      {/* Card list */}
+      <div className="flex-1 overflow-y-auto py-2 space-y-1.5 px-2">
+        {isLoading && (
+          <div className="space-y-1.5 mt-1">
+            {[1, 2, 3].map((i) => (
+              <div key={i} className="h-20 rounded-lg bg-slate-800/50 animate-pulse" />
+            ))}
+          </div>
+        )}
+
+        {!isLoading && history?.length === 0 && (
+          <div className="flex flex-col items-center justify-center py-12 gap-3">
+            <div className="w-10 h-10 rounded-full border border-slate-800 flex items-center justify-center">
+              <IconHistory className="w-5 h-5 text-slate-700" />
+            </div>
+            <p className="text-[10px] font-mono text-slate-600 text-center leading-relaxed">
+              No analyses yet.<br />Submit a new simulation.
+            </p>
+          </div>
+        )}
+
+        {history?.map((item) => (
+          <HistoryCard
+            key={item.run_id}
+            item={item}
+            isActive={item.run_id === activeJobId}
+            onClick={() => onSelect(item.run_id)}
+          />
+        ))}
       </div>
     </div>
   )
@@ -520,6 +753,13 @@ export function VirtualSensorDashboard() {
     retry: 2,
   })
 
+  // ── Refresh history when a job reaches a terminal state ────────────────
+  useEffect(() => {
+    if (currentStatus === 'completed' || currentStatus === 'failed') {
+      queryClient.invalidateQueries({ queryKey: ['sensorHistory'] })
+    }
+  }, [currentStatus, queryClient])
+
   const isRunning =
     submitMutation.isPending ||
     currentStatus === 'pending' ||
@@ -537,6 +777,15 @@ export function VirtualSensorDashboard() {
       setActiveJobId(null)
       setLastNoiseSigma(req.obs_noise_std_K)
       submitMutation.mutate(req)
+    },
+    [submitMutation],
+  )
+
+  // Load a completed analysis from history without re-running
+  const handleSelectHistory = useCallback(
+    (runId: string) => {
+      submitMutation.reset()
+      setActiveJobId(runId)
     },
     [submitMutation],
   )
@@ -595,8 +844,8 @@ export function VirtualSensorDashboard() {
     <div className="min-h-screen flex flex-col" style={{ background: '#020617' }}>
 
       {/* ── HMI Header ──────────────────────────────────────────────────── */}
-      <header className="border-b border-slate-800 bg-slate-950">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3.5 flex items-center gap-3">
+      <header className="border-b border-slate-800 bg-slate-950 shrink-0">
+        <div className="px-4 sm:px-6 lg:px-8 py-3.5 flex items-center gap-3">
 
           {/* Reactor icon */}
           <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-cyan-900/60 border border-cyan-700/40 shrink-0">
@@ -615,11 +864,11 @@ export function VirtualSensorDashboard() {
               <h1 className="text-sm font-bold tracking-wider text-slate-100 uppercase font-mono">
                 {t('header.title')}
               </h1>
-              <span className="hidden sm:inline text-[10px] text-slate-600 font-mono border border-slate-800 rounded px-1.5 py-0.5">
+              <span className="hidden sm:inline text-[10px] text-slate-500 font-mono border border-slate-800 rounded px-1.5 py-0.5">
                 {t('header.tagline')}
               </span>
             </div>
-            <p className="text-[10px] text-slate-600 font-mono mt-0.5 pl-4">
+            <p className="text-[10px] text-slate-500 font-mono mt-0.5 pl-4">
               {t('header.subtitle')}
             </p>
           </div>
@@ -643,7 +892,7 @@ export function VirtualSensorDashboard() {
                 disabled={isExporting}
                 className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg
                   border border-slate-700 bg-slate-800 hover:bg-slate-700
-                  text-xs font-semibold text-slate-300 tracking-wide font-mono
+                  text-xs font-semibold text-slate-200 tracking-wide font-mono
                   transition focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-offset-2 focus:ring-offset-slate-950
                   disabled:opacity-50 disabled:cursor-not-allowed"
                 title={`Export job ${activeJobId}`}
@@ -664,7 +913,7 @@ export function VirtualSensorDashboard() {
 
             <LanguageSelector />
 
-            <div className="hidden sm:flex items-center gap-1.5 text-[10px] text-slate-600 font-mono">
+            <div className="hidden sm:flex items-center gap-1.5 text-[10px] text-slate-500 font-mono">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block" aria-hidden />
               {t('header.api')}
             </div>
@@ -672,270 +921,289 @@ export function VirtualSensorDashboard() {
         </div>
       </header>
 
-      {/* ── Exportable content area ──────────────────────────────────────── */}
-      <div ref={exportRef} style={{ background: '#020617' }}>
-        <main className="max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-6 space-y-5 flex-1">
+      {/* ── Body: sidebar + main ─────────────────────────────────────────── */}
+      <div className="flex flex-1 min-h-0">
 
-          {/* ── Parameter configuration ───────────────────────────────── */}
-          <section className="bg-slate-900 border border-slate-800 rounded-xl p-5">
-            <div className="flex items-center gap-2 mb-5">
-              <div className="w-1 h-4 rounded-full bg-cyan-500" />
-              <h2 className="text-[10px] font-bold tracking-widest text-slate-400 uppercase font-mono">
-                {t('sections.filterParams')}
-              </h2>
-            </div>
-            <SensorForm onSubmit={handleSubmit} disabled={isRunning} />
+        {/* ── History Sidebar (hidden on small screens) ───────────────── */}
+        <aside className="hidden lg:flex lg:flex-col w-72 shrink-0 border-r border-slate-800 bg-slate-950 overflow-hidden">
+          <HistorySidebar activeJobId={activeJobId} onSelect={handleSelectHistory} />
+        </aside>
 
-            {submitMutation.isError && (
-              <div className="mt-4 flex items-start gap-2 p-3 bg-red-950/60 border border-red-800/50 rounded-lg text-xs text-red-300 font-mono">
-                <svg className="h-4 w-4 mt-0.5 shrink-0 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                    d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                </svg>
-                <span>
-                  <strong className="text-red-400">{t('error.error')}</strong>{' '}
-                  {submitMutation.error instanceof Error
-                    ? submitMutation.error.message
-                    : t('error.networkError')}
-                </span>
-              </div>
-            )}
-          </section>
+        {/* ── Main scrollable content ─────────────────────────────────── */}
+        <div className="flex-1 overflow-y-auto">
+          <div ref={exportRef} style={{ background: '#020617' }}>
+            <main className="max-w-5xl mx-auto w-full px-4 sm:px-6 py-6 space-y-5">
 
-          {/* ── Running banner ─────────────────────────────────────────── */}
-          {activeJobId && isRunning && <RunningBanner jobId={activeJobId} />}
-
-          {/* ── Worker error ───────────────────────────────────────────── */}
-          {statusData?.error_message && (
-            <div className="bg-red-950/60 border border-red-800/50 rounded-xl p-4 text-sm text-red-300 font-mono">
-              <span className="text-red-500 font-bold">{t('error.workerError')} </span>
-              {statusData.error_message}
-            </div>
-          )}
-
-          {/* ── Smart Switch panel ─────────────────────────────────────── */}
-          {(deviceUsed || executionTime != null) && (
-            <ExecutionPanel
-              executionTime={executionTime}
-              deviceUsed={deviceUsed}
-              deviceReason={deviceReason}
-            />
-          )}
-
-          {/* ── KPI metrics strip ──────────────────────────────────────── */}
-          {metrics && (
-            <section>
-              <div className="flex items-center gap-2 mb-3">
-                <div className="w-1 h-4 rounded-full bg-emerald-500" />
-                <h2 className="text-[10px] font-bold tracking-widest text-slate-500 uppercase font-mono">
-                  {t('sections.filterMetrics')}
-                </h2>
-                <span className="ml-auto text-[10px] text-slate-600 font-mono">
-                  {t('metrics.totalPoints', { n: metrics.total_points.toLocaleString() })}
-                </span>
-              </div>
-              <MetricsStrip m={metrics} obsSigma={lastNoiseSigma} />
-
-              {/* Calibration indicator */}
-              <div className="mt-3 bg-slate-900 border border-slate-800 rounded-lg px-4 py-2.5
-                flex flex-wrap items-center gap-x-6 gap-y-1 text-[10px] font-mono text-slate-500">
-                <span className="text-slate-400 font-semibold">{t('calibration.title')}</span>
-
-                <span className="flex items-center gap-1">
-                  {t('calibration.cov68')}{' '}
-                  {metrics.coverage_68pct == null
-                    ? <span className="text-slate-500">—</span>
-                    : coverageGrade(metrics.coverage_68pct, 68.3) === 'good'
-                      ? <span className="inline-flex items-center gap-1 text-emerald-400">
-                          <IconCheck className="w-3 h-3" /> {t('calibration.calibrated')}
-                        </span>
-                      : <span className="inline-flex items-center gap-1 text-amber-400">
-                          <IconWarning className="w-3 h-3" />
-                          {t('calibration.deviation')} {Math.abs(metrics.coverage_68pct - 68.3).toFixed(1)}%
-                        </span>
-                  }
-                </span>
-
-                <span className="flex items-center gap-1">
-                  {t('calibration.cov95')}{' '}
-                  {metrics.coverage_95pct == null
-                    ? <span className="text-slate-500">—</span>
-                    : coverageGrade(metrics.coverage_95pct, 95.4) === 'good'
-                      ? <span className="inline-flex items-center gap-1 text-emerald-400">
-                          <IconCheck className="w-3 h-3" /> {t('calibration.calibrated')}
-                        </span>
-                      : <span className="inline-flex items-center gap-1 text-amber-400">
-                          <IconWarning className="w-3 h-3" />
-                          {t('calibration.deviation')} {Math.abs(metrics.coverage_95pct - 95.4).toFixed(1)}%
-                        </span>
-                  }
-                </span>
-
-                <span className="ml-auto text-slate-600">
-                  σ_RTD = {lastNoiseSigma.toFixed(1)} K · RMSE/σ ={' '}
-                  {metrics.rmse_K != null && isFinite(metrics.rmse_K)
-                    ? `${(metrics.rmse_K / lastNoiseSigma * 100).toFixed(0)}%`
-                    : '—'
-                  }
-                </span>
-              </div>
-            </section>
-          )}
-
-          {/* ── Main chart ─────────────────────────────────────────────── */}
-          {chartData.length > 0 && (
-            <section>
-              <div className="flex items-center gap-2 mb-3">
-                <div className="w-1 h-4 rounded-full bg-sky-400" />
-                <h2 className="text-[10px] font-bold tracking-widest text-slate-500 uppercase font-mono">
-                  {t('sections.transientResponse')}
-                </h2>
-                {resultsData?.truncated && (
-                  <span className="ml-auto inline-flex items-center gap-1 text-[10px] text-amber-500/70 font-mono">
-                    <IconWarning className="w-3 h-3" />
-                    {t('chart.truncated', {
-                      n:     resultsData.point_count.toLocaleString(),
-                      total: resultsData.total_point_count.toLocaleString(),
-                    })}
-                  </span>
-                )}
-              </div>
-
-              <VirtualSensorChart
-                data={chartData}
-                nominalFuelC={NOM_FUEL_C}
-                nominalCoolC={NOM_COOL_C}
-              />
-
-              {/* Legend */}
-              <div className="mt-3 bg-slate-900 border border-slate-800 rounded-lg px-4 py-3
-                grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-2 text-[10px] font-mono text-slate-500">
-                <div className="flex items-center gap-2">
-                  <svg width="24" height="8" aria-hidden><line x1="0" y1="4" x2="24" y2="4" stroke="#38bdf8" strokeWidth="2.5" /></svg>
-                  <span>
-                    <span className="text-cyan-300">{t('legendLabels.inferred')}</span>
-                    {' — '}{t('legend.inferredDesc')}
-                  </span>
+              {/* ── Parameter configuration ─────────────────────────── */}
+              <section className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                <div className="flex items-center gap-2 mb-5">
+                  <div className="w-1 h-4 rounded-full bg-cyan-500" />
+                  <h2 className="text-[10px] font-bold tracking-widest text-slate-400 uppercase font-mono">
+                    {t('sections.filterParams')}
+                  </h2>
                 </div>
-                <div className="flex items-center gap-2">
-                  <svg width="24" height="8" aria-hidden><line x1="0" y1="4" x2="24" y2="4" stroke="#f87171" strokeWidth="1.5" strokeDasharray="5 3" /></svg>
-                  <span>
-                    <span className="text-red-400">{t('legendLabels.true')}</span>
-                    {' — '}{t('legend.trueDesc')}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="inline-block w-6 h-3 rounded-sm" style={{ background: 'rgba(56,189,248,0.14)', border: '1px solid #38bdf8' }} aria-hidden />
-                  <span>
-                    <span className="text-sky-300">{t('legendLabels.ci')}</span>
-                    {' — '}{t('legend.ciDesc')}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="inline-block w-2.5 h-2.5 rounded-full bg-amber-400" aria-hidden />
-                  <span>
-                    <span className="text-amber-400">{t('legendLabels.rtd')}</span>
-                    {' — '}{t('legend.rtdDesc', { sigma: lastNoiseSigma.toFixed(1) })}
-                  </span>
-                </div>
-              </div>
-            </section>
-          )}
+                <SensorForm onSubmit={handleSubmit} disabled={isRunning} />
 
-          {/* ── Results loading spinner ────────────────────────────────── */}
-          {resultsLoading && (
-            <div className="flex flex-col items-center justify-center py-16 gap-4">
-              <div className="relative">
-                <div className="w-12 h-12 rounded-full border-2 border-slate-800 border-t-cyan-400 animate-spin" />
-                <div className="absolute inset-0 flex items-center justify-center">
-                  <div className="w-3 h-3 rounded-full bg-cyan-600 animate-pulse" />
-                </div>
-              </div>
-              <p className="text-xs text-slate-500 font-mono">{t('loading.results')}</p>
-            </div>
-          )}
-
-          {/* ── Empty state ────────────────────────────────────────────── */}
-          {!activeJobId && !submitMutation.isPending && (
-            <div className="flex flex-col items-center justify-center py-20 text-center gap-5">
-              {/* Schematic reactor core */}
-              <div className="relative w-24 h-24" aria-hidden>
-                <div className="absolute inset-0 rounded-full border-2 border-slate-800" />
-                <div className="absolute inset-3 rounded-full border border-slate-700" />
-                <div className="absolute inset-6 rounded-full border border-slate-600" />
-                <div className="absolute inset-0 flex items-center justify-center">
-                  <div className="w-4 h-4 rounded-full bg-slate-800 border border-slate-600" />
-                </div>
-                {[0, 72, 144, 216, 288].map((deg) => (
-                  <div
-                    key={deg}
-                    className="absolute w-1.5 h-1.5 rounded-full bg-slate-600"
-                    style={{
-                      top: '50%', left: '50%',
-                      transform: `rotate(${deg}deg) translateX(36px) translate(-50%, -50%)`,
-                    }}
-                  />
-                ))}
-              </div>
-              <div>
-                <p className="text-slate-400 font-semibold font-mono text-sm">
-                  {t('empty.title')}
-                </p>
-                <p className="text-slate-600 text-xs font-mono mt-2 max-w-md">
-                  {t('empty.desc')}
-                </p>
-              </div>
-              <div className="grid grid-cols-3 gap-6 text-[10px] text-slate-600 font-mono max-w-sm">
-                {([
-                  {
-                    icon: (
-                      <svg className="w-6 h-6 mx-auto text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
-                          d="M13 10V3L4 14h7v7l9-11h-7z" />
-                      </svg>
-                    ),
-                    title: t('empty.rk4Title'),
-                    sub:   t('empty.rk4Sub'),
-                  },
-                  {
-                    icon: (
-                      <svg className="w-6 h-6 mx-auto text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-                        <circle cx="12" cy="12" r="10" strokeWidth="1.5" />
-                        <circle cx="12" cy="12" r="6" strokeWidth="1.5" />
-                        <circle cx="12" cy="12" r="2" strokeWidth="1.5" />
-                        <path d="M12 2v4M12 18v4M2 12h4M18 12h4" strokeWidth="1.5" strokeLinecap="round" />
-                      </svg>
-                    ),
-                    title: t('empty.enkfTitle'),
-                    sub:   t('empty.enkfSub'),
-                  },
-                  {
-                    icon: (
-                      <svg className="w-6 h-6 mx-auto text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-                        <ellipse cx="12" cy="5" rx="9" ry="3" strokeWidth="1.5" />
-                        <path strokeWidth="1.5" d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
-                      </svg>
-                    ),
-                    title: t('empty.dbTitle'),
-                    sub:   t('empty.dbSub'),
-                  },
-                ] as const).map(({ icon, title, sub }) => (
-                  <div key={title} className="text-center space-y-2">
-                    {icon}
-                    <div className="text-slate-500">{title}</div>
-                    <div>{sub}</div>
+                {submitMutation.isError && (
+                  <div className="mt-4 flex items-start gap-2 p-3 bg-red-950/60 border border-red-800/50 rounded-lg text-xs text-red-300 font-mono">
+                    <svg className="h-4 w-4 mt-0.5 shrink-0 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                        d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <span>
+                      <strong className="text-red-400">{t('error.error')}</strong>{' '}
+                      {submitMutation.error instanceof Error
+                        ? submitMutation.error.message
+                        : t('error.networkError')}
+                    </span>
                   </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </main>
+                )}
+              </section>
+
+              {/* ── Running banner ───────────────────────────────────── */}
+              {activeJobId && isRunning && <RunningBanner jobId={activeJobId} />}
+
+              {/* ── Worker error ─────────────────────────────────────── */}
+              {statusData?.error_message && (
+                <div className="bg-red-950/60 border border-red-800/50 rounded-xl p-4 text-sm text-red-300 font-mono">
+                  <span className="text-red-400 font-bold">{t('error.workerError')} </span>
+                  {statusData.error_message}
+                </div>
+              )}
+
+              {/* ── Analysis date/time ───────────────────────────────── */}
+              {statusData?.created_at && (currentStatus === 'completed' || currentStatus === 'failed') && (
+                <AnalysisDateBanner
+                  createdAt={statusData.created_at}
+                  jobId={activeJobId!}
+                />
+              )}
+
+              {/* ── Smart Switch panel ───────────────────────────────── */}
+              {(deviceUsed || executionTime != null) && (
+                <ExecutionPanel
+                  executionTime={executionTime}
+                  deviceUsed={deviceUsed}
+                  deviceReason={deviceReason}
+                />
+              )}
+
+              {/* ── KPI metrics strip ────────────────────────────────── */}
+              {metrics && (
+                <section>
+                  <div className="flex items-center gap-2 mb-3">
+                    <div className="w-1 h-4 rounded-full bg-emerald-500" />
+                    <h2 className="text-[10px] font-bold tracking-widest text-slate-400 uppercase font-mono">
+                      {t('sections.filterMetrics')}
+                    </h2>
+                    <span className="ml-auto text-[10px] text-slate-500 font-mono">
+                      {t('metrics.totalPoints', { n: metrics.total_points.toLocaleString() })}
+                    </span>
+                  </div>
+                  <MetricsStrip m={metrics} obsSigma={lastNoiseSigma} />
+
+                  {/* Calibration indicator */}
+                  <div className="mt-3 bg-slate-900 border border-slate-800 rounded-lg px-4 py-2.5
+                    flex flex-wrap items-center gap-x-6 gap-y-1 text-[10px] font-mono text-slate-400">
+                    <span className="text-slate-300 font-semibold">{t('calibration.title')}</span>
+
+                    <span className="flex items-center gap-1">
+                      {t('calibration.cov68')}{' '}
+                      {metrics.coverage_68pct == null
+                        ? <span className="text-slate-500">—</span>
+                        : coverageGrade(metrics.coverage_68pct, 68.3) === 'good'
+                          ? <span className="inline-flex items-center gap-1 text-emerald-400">
+                              <IconCheck className="w-3 h-3" /> {t('calibration.calibrated')}
+                            </span>
+                          : <span className="inline-flex items-center gap-1 text-amber-400">
+                              <IconWarning className="w-3 h-3" />
+                              {t('calibration.deviation')} {Math.abs(metrics.coverage_68pct - 68.3).toFixed(1)}%
+                            </span>
+                      }
+                    </span>
+
+                    <span className="flex items-center gap-1">
+                      {t('calibration.cov95')}{' '}
+                      {metrics.coverage_95pct == null
+                        ? <span className="text-slate-500">—</span>
+                        : coverageGrade(metrics.coverage_95pct, 95.4) === 'good'
+                          ? <span className="inline-flex items-center gap-1 text-emerald-400">
+                              <IconCheck className="w-3 h-3" /> {t('calibration.calibrated')}
+                            </span>
+                          : <span className="inline-flex items-center gap-1 text-amber-400">
+                              <IconWarning className="w-3 h-3" />
+                              {t('calibration.deviation')} {Math.abs(metrics.coverage_95pct - 95.4).toFixed(1)}%
+                            </span>
+                      }
+                    </span>
+
+                    <span className="ml-auto text-slate-500">
+                      σ_RTD = {lastNoiseSigma.toFixed(1)} K · RMSE/σ ={' '}
+                      {metrics.rmse_K != null && isFinite(metrics.rmse_K)
+                        ? `${(metrics.rmse_K / lastNoiseSigma * 100).toFixed(0)}%`
+                        : '—'
+                      }
+                    </span>
+                  </div>
+                </section>
+              )}
+
+              {/* ── Main chart ───────────────────────────────────────── */}
+              {chartData.length > 0 && (
+                <section>
+                  <div className="flex items-center gap-2 mb-3">
+                    <div className="w-1 h-4 rounded-full bg-sky-400" />
+                    <h2 className="text-[10px] font-bold tracking-widest text-slate-400 uppercase font-mono">
+                      {t('sections.transientResponse')}
+                    </h2>
+                    {resultsData?.truncated && (
+                      <span className="ml-auto inline-flex items-center gap-1 text-[10px] text-amber-400 font-mono">
+                        <IconWarning className="w-3 h-3" />
+                        {t('chart.truncated', {
+                          n:     resultsData.point_count.toLocaleString(),
+                          total: resultsData.total_point_count.toLocaleString(),
+                        })}
+                      </span>
+                    )}
+                  </div>
+
+                  <VirtualSensorChart
+                    data={chartData}
+                    nominalFuelC={NOM_FUEL_C}
+                    nominalCoolC={NOM_COOL_C}
+                  />
+
+                  {/* Legend */}
+                  <div className="mt-3 bg-slate-900 border border-slate-800 rounded-lg px-4 py-3
+                    grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-2 text-[10px] font-mono text-slate-400">
+                    <div className="flex items-center gap-2">
+                      <svg width="24" height="8" aria-hidden><line x1="0" y1="4" x2="24" y2="4" stroke="#38bdf8" strokeWidth="2.5" /></svg>
+                      <span>
+                        <span className="text-cyan-300">{t('legendLabels.inferred')}</span>
+                        {' — '}{t('legend.inferredDesc')}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <svg width="24" height="8" aria-hidden><line x1="0" y1="4" x2="24" y2="4" stroke="#f87171" strokeWidth="1.5" strokeDasharray="5 3" /></svg>
+                      <span>
+                        <span className="text-red-400">{t('legendLabels.true')}</span>
+                        {' — '}{t('legend.trueDesc')}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="inline-block w-6 h-3 rounded-sm" style={{ background: 'rgba(56,189,248,0.14)', border: '1px solid #38bdf8' }} aria-hidden />
+                      <span>
+                        <span className="text-sky-300">{t('legendLabels.ci')}</span>
+                        {' — '}{t('legend.ciDesc')}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="inline-block w-2.5 h-2.5 rounded-full bg-amber-400" aria-hidden />
+                      <span>
+                        <span className="text-amber-400">{t('legendLabels.rtd')}</span>
+                        {' — '}{t('legend.rtdDesc', { sigma: lastNoiseSigma.toFixed(1) })}
+                      </span>
+                    </div>
+                  </div>
+                </section>
+              )}
+
+              {/* ── Results loading spinner ──────────────────────────── */}
+              {resultsLoading && (
+                <div className="flex flex-col items-center justify-center py-16 gap-4">
+                  <div className="relative">
+                    <div className="w-12 h-12 rounded-full border-2 border-slate-800 border-t-cyan-400 animate-spin" />
+                    <div className="absolute inset-0 flex items-center justify-center">
+                      <div className="w-3 h-3 rounded-full bg-cyan-600 animate-pulse" />
+                    </div>
+                  </div>
+                  <p className="text-xs text-slate-400 font-mono">{t('loading.results')}</p>
+                </div>
+              )}
+
+              {/* ── Empty state ──────────────────────────────────────── */}
+              {!activeJobId && !submitMutation.isPending && (
+                <div className="flex flex-col items-center justify-center py-20 text-center gap-5">
+                  {/* Schematic reactor core */}
+                  <div className="relative w-24 h-24" aria-hidden>
+                    <div className="absolute inset-0 rounded-full border-2 border-slate-800" />
+                    <div className="absolute inset-3 rounded-full border border-slate-700" />
+                    <div className="absolute inset-6 rounded-full border border-slate-600" />
+                    <div className="absolute inset-0 flex items-center justify-center">
+                      <div className="w-4 h-4 rounded-full bg-slate-800 border border-slate-600" />
+                    </div>
+                    {[0, 72, 144, 216, 288].map((deg) => (
+                      <div
+                        key={deg}
+                        className="absolute w-1.5 h-1.5 rounded-full bg-slate-600"
+                        style={{
+                          top: '50%', left: '50%',
+                          transform: `rotate(${deg}deg) translateX(36px) translate(-50%, -50%)`,
+                        }}
+                      />
+                    ))}
+                  </div>
+                  <div>
+                    <p className="text-slate-300 font-semibold font-mono text-sm">
+                      {t('empty.title')}
+                    </p>
+                    <p className="text-slate-500 text-xs font-mono mt-2 max-w-md">
+                      {t('empty.desc')}
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-3 gap-6 text-[10px] text-slate-500 font-mono max-w-sm">
+                    {([
+                      {
+                        icon: (
+                          <svg className="w-6 h-6 mx-auto text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+                              d="M13 10V3L4 14h7v7l9-11h-7z" />
+                          </svg>
+                        ),
+                        title: t('empty.rk4Title'),
+                        sub:   t('empty.rk4Sub'),
+                      },
+                      {
+                        icon: (
+                          <svg className="w-6 h-6 mx-auto text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                            <circle cx="12" cy="12" r="10" strokeWidth="1.5" />
+                            <circle cx="12" cy="12" r="6" strokeWidth="1.5" />
+                            <circle cx="12" cy="12" r="2" strokeWidth="1.5" />
+                            <path d="M12 2v4M12 18v4M2 12h4M18 12h4" strokeWidth="1.5" strokeLinecap="round" />
+                          </svg>
+                        ),
+                        title: t('empty.enkfTitle'),
+                        sub:   t('empty.enkfSub'),
+                      },
+                      {
+                        icon: (
+                          <svg className="w-6 h-6 mx-auto text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                            <ellipse cx="12" cy="5" rx="9" ry="3" strokeWidth="1.5" />
+                            <path strokeWidth="1.5" d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
+                          </svg>
+                        ),
+                        title: t('empty.dbTitle'),
+                        sub:   t('empty.dbSub'),
+                      },
+                    ] as const).map(({ icon, title, sub }) => (
+                      <div key={title} className="text-center space-y-2">
+                        {icon}
+                        <div className="text-slate-400">{title}</div>
+                        <div className="text-slate-600">{sub}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </main>
+          </div>
+        </div>
       </div>
 
       {/* ── Footer ────────────────────────────────────────────────────────── */}
-      <footer className="border-t border-slate-900">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-2.5
-          flex flex-wrap justify-between gap-2 text-[10px] font-mono text-slate-700">
+      <footer className="border-t border-slate-900 shrink-0">
+        <div className="px-4 sm:px-6 lg:px-8 py-2.5
+          flex flex-wrap justify-between gap-2 text-[10px] font-mono text-slate-500">
           <span>{t('footer.left')}</span>
           <span>{t('footer.right')}</span>
         </div>

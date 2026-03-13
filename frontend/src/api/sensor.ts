@@ -4,6 +4,7 @@ import type {
   SensorSimulateResponse,
   SensorJobStatus,
   SensorResultsResponse,
+  SensorHistoryItem,
 } from '../types'
 
 /** POST /sensor/simulate — enqueue an EnKF virtual-sensor job. */
@@ -34,5 +35,11 @@ export async function getSensorResults(
     `/sensor/${jobId}/results`,
     { params: { max_points: maxPoints } },
   )
+  return data
+}
+
+/** GET /sensor/runs/history — all simulations ordered by created_at DESC. */
+export async function getSensorHistory(): Promise<SensorHistoryItem[]> {
+  const { data } = await client.get<SensorHistoryItem[]>('/sensor/runs/history')
   return data
 }
