@@ -154,6 +154,25 @@ function IconHistory({ className = 'w-4 h-4' }: { className?: string }) {
   )
 }
 
+function IconPanelLeft({ className = 'w-4 h-4' }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+      <rect x="3" y="3" width="18" height="18" rx="2" strokeWidth="1.5" />
+      <path strokeLinecap="round" strokeWidth="1.5" d="M9 3v18" />
+    </svg>
+  )
+}
+
+function IconPanelLeftClose({ className = 'w-4 h-4' }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+      <rect x="3" y="3" width="18" height="18" rx="2" strokeWidth="1.5" />
+      <path strokeLinecap="round" strokeWidth="1.5" d="M9 3v18" />
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M14 9l-3 3 3 3" />
+    </svg>
+  )
+}
+
 // ── Language selector ─────────────────────────────────────────────────────────
 
 function LanguageSelector() {
@@ -581,14 +600,21 @@ const STATUS_BAR: Record<RunStatus, string> = {
 }
 
 function HistoryCard({ item, isActive, onClick }: HistoryCardProps) {
-  const date   = new Date(item.created_at)
-  const dateStr = date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
+  const date    = new Date(item.created_at)
+  const dateStr = date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
   const timeStr = date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+
+  const statusBadgeCls: Record<RunStatus, string> = {
+    completed: 'bg-emerald-950 text-emerald-400 border-emerald-800/60',
+    running:   'bg-cyan-950 text-cyan-400 border-cyan-800/60',
+    pending:   'bg-amber-950 text-amber-400 border-amber-800/60',
+    failed:    'bg-red-950 text-red-400 border-red-800/60',
+  }
 
   return (
     <button
       onClick={onClick}
-      className={`w-full text-left px-3 py-2.5 rounded-lg border-l-2 transition-all
+      className={`w-full text-left px-2.5 py-2 rounded-lg border-l-2 transition-all
         ${STATUS_BAR[item.status]}
         ${isActive
           ? 'bg-slate-800 border border-l-2 border-slate-600'
@@ -596,48 +622,38 @@ function HistoryCard({ item, isActive, onClick }: HistoryCardProps) {
         }
         focus:outline-none focus:ring-1 focus:ring-cyan-600/50`}
     >
-      {/* Date row */}
-      <p className="text-[11px] font-mono text-slate-200 leading-tight">{dateStr}</p>
-      <p className="text-[10px] font-mono text-slate-500 leading-tight mt-0.5">{timeStr}</p>
-
-      {/* Status + device row */}
-      <div className="flex items-center justify-between mt-2 gap-1">
-        <span className={`text-[10px] font-bold font-mono ${STATUS_COLOR[item.status]}`}>
-          {STATUS_TEXT[item.status]}
+      {/* Row 1 — date/time (left) | status + device badges (right) */}
+      <div className="flex items-center justify-between gap-1.5">
+        <span className="text-[10px] font-mono text-slate-200 leading-none shrink-0">
+          {dateStr}
+          <span className="text-slate-500 ml-1">{timeStr}</span>
         </span>
-        {item.device_used && (
-          <span className="text-[10px] font-mono text-slate-500 bg-slate-800 rounded px-1.5 py-0.5">
-            {item.device_used.toUpperCase()}
+        <div className="flex items-center gap-1 shrink-0">
+          <span className={`text-[9px] font-bold font-mono px-1 py-0.5 rounded border ${statusBadgeCls[item.status]}`}>
+            {STATUS_TEXT[item.status]}
           </span>
-        )}
+          {item.device_used && (
+            <span className="text-[9px] font-mono text-slate-400 bg-slate-800 border border-slate-700 rounded px-1 py-0.5">
+              {item.device_used.toUpperCase()}
+            </span>
+          )}
+        </div>
       </div>
 
-      {/* RMSE */}
-      {item.rmse_K != null ? (
-        <div className="mt-1.5 flex items-center justify-between">
-          <span className="text-[10px] font-mono text-slate-500">RMSE</span>
-          <span className={`text-[11px] font-mono font-semibold tabular-nums
+      {/* Row 2 — exec time (left) | RMSE (right) */}
+      <div className="flex items-center justify-between mt-1 gap-1">
+        <span className="text-[10px] font-mono text-slate-600 tabular-nums">
+          {item.execution_time_s != null ? `${item.execution_time_s.toFixed(1)}s` : '—'}
+        </span>
+        {item.rmse_K != null ? (
+          <span className={`text-[10px] font-mono tabular-nums
             ${item.rmse_K < 1 ? 'text-emerald-400' : item.rmse_K < 3 ? 'text-amber-400' : 'text-red-400'}`}>
-            {item.rmse_K.toFixed(3)} K
+            RMSE {item.rmse_K.toFixed(3)} K
           </span>
-        </div>
-      ) : (
-        item.status !== 'completed' && (
-          <div className="mt-1.5">
-            <span className="text-[10px] font-mono text-slate-600">—</span>
-          </div>
-        )
-      )}
-
-      {/* Execution time */}
-      {item.execution_time_s != null && (
-        <div className="mt-1 flex items-center justify-between">
-          <span className="text-[10px] font-mono text-slate-600">Exec</span>
-          <span className="text-[10px] font-mono text-slate-500 tabular-nums">
-            {item.execution_time_s.toFixed(2)} s
-          </span>
-        </div>
-      )}
+        ) : (
+          <span className="text-[10px] font-mono text-slate-700">—</span>
+        )}
+      </div>
     </button>
   )
 }
@@ -717,6 +733,7 @@ export function VirtualSensorDashboard() {
   const [activeJobId, setActiveJobId]       = useState<string | null>(null)
   const [lastNoiseSigma, setLastNoiseSigma] = useState(FORM_DEFAULTS.obs_noise_std_K)
   const [isExporting, setIsExporting]       = useState(false)
+  const [isSidebarOpen, setIsSidebarOpen]   = useState(true)
   const chartRef                            = useRef<HTMLDivElement>(null)
   const queryClient                         = useQueryClient()
 
@@ -971,6 +988,23 @@ export function VirtualSensorDashboard() {
       <header className="border-b border-slate-800 bg-slate-950 shrink-0">
         <div className="px-4 sm:px-6 lg:px-8 py-3.5 flex items-center gap-3">
 
+          {/* Sidebar toggle — only visible on large screens where sidebar exists */}
+          <button
+            type="button"
+            onClick={() => setIsSidebarOpen((v) => !v)}
+            className="hidden lg:flex items-center justify-center w-8 h-8 rounded-md
+              border border-slate-700 bg-slate-900 hover:bg-slate-800 hover:border-slate-600
+              text-slate-400 hover:text-slate-200 transition shrink-0
+              focus:outline-none focus:ring-1 focus:ring-cyan-600/50"
+            title={isSidebarOpen ? 'Hide history panel' : 'Show history panel'}
+            aria-pressed={isSidebarOpen}
+          >
+            {isSidebarOpen
+              ? <IconPanelLeftClose className="w-4 h-4" />
+              : <IconPanelLeft      className="w-4 h-4" />
+            }
+          </button>
+
           {/* Reactor icon */}
           <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-cyan-900/60 border border-cyan-700/40 shrink-0">
             <svg className="w-5 h-5 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
@@ -1048,8 +1082,14 @@ export function VirtualSensorDashboard() {
       {/* ── Body: sidebar + main ─────────────────────────────────────────── */}
       <div className="flex flex-1 min-h-0">
 
-        {/* ── History Sidebar (hidden on small screens) ───────────────── */}
-        <aside className="hidden lg:flex lg:flex-col w-72 shrink-0 border-r border-slate-800 bg-slate-950 overflow-hidden">
+        {/* ── History Sidebar (hidden on small screens; toggle on lg+) ── */}
+        <aside
+          className={`
+            ${isSidebarOpen ? 'hidden lg:flex lg:flex-col' : 'hidden'}
+            w-72 shrink-0 border-r border-slate-800 bg-slate-950
+            h-[calc(100vh-3.875rem)] sticky top-0 overflow-hidden
+          `}
+        >
           <HistorySidebar activeJobId={activeJobId} onSelect={handleSelectHistory} />
         </aside>
 
